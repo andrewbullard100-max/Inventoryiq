@@ -60,6 +60,8 @@ export default async function handler(req, res) {
       confidence: i.confidence ?? 0,
       match_status: i.matchStatus || 'unknown',
       manual_override: i.override ?? null,
+      stage_id: i.stageId ?? null,
+      stage_name: i.stageName ?? null,
     }));
 
     const { error: itemsErr } = await supabase.from('count_items').insert(rows);

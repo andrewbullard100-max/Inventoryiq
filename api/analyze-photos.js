@@ -39,8 +39,8 @@ export default async function handler(req, res) {
       res.status(400).json({ error: 'images must be a non-empty array' });
       return;
     }
-    if (images.length > 20) {
-      res.status(400).json({ error: 'Max 20 images per request' });
+    if (images.length > 5) {
+      res.status(400).json({ error: 'Max 5 images per stage' });
       return;
     }
 

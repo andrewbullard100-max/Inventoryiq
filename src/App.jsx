@@ -269,7 +269,7 @@ async function parseInvoice(file) {
 async function loadCatalog() {
   const res = await fetch("/api/catalog");
   if (!res.ok) throw new Error(`Failed to load catalog (${res.status})`);
-  const { locations: rawLocations, areas: rawAreas, items: rawItems, assignments: rawAssignments } = await res.json();
+  const { locations: rawLocations, areas: rawAreas, items: rawItems, assignments: rawAssignments, stages: rawStages } = await res.json();
 
   const areasByLocation = {};
   for (const a of rawAreas) (areasByLocation[a.location_id] ||= []).push({ id: a.id, name: a.name });
@@ -294,7 +294,36 @@ async function loadCatalog() {
     locationId: areaToLocation[a.area_id], par: a.par_level || 0,
   }));
 
-  return { locations, items, assignments };
+  const stages = (rawStages || []).map(s => ({
+    id: s.id, areaId: s.area_id, name: s.name, sortOrder: s.sort_order || 0,
+  }));
+
+  return { locations, items, assignments, stages };
+}
+
+// ─── Backend proxy: persist named stages for an area (persists across sessions) ─
+async function saveStagesToBackend(areaId, stagesToSave) {
+  const res = await fetch("/api/upsert-stages", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ areaId, stages: stagesToSave.map(s => ({ id: s.id, name: s.name, sortOrder: s.sortOrder })) }),
+  });
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error(body.error || `Saving stages failed (${res.status})`);
+  }
+  return res.json(); // { stages: [{id, area_id, name, sort_order}] }
+}
+
+async function removeStageFromBackend(stageId) {
+  const res = await fetch("/api/upsert-stages", {
+    method: "DELETE", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ id: stageId }),
+  });
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error(body.error || `Removing stage failed (${res.status})`);
+  }
+  return res.json();
 }
 
 // ─── Backend proxy: reference photos for hard-to-identify items ─────────────
@@ -363,7 +392,7 @@ async function finalizeCountToBackend(areaId, requireApproval, items) {
     method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       areaId, requireApproval,
-      items: items.map(i => ({ itemId: i.itemId || i.sku, aiCount: i.aiCount, confidence: i.confidence, matchStatus: i.matchStatus, override: i.override })),
+      items: items.map(i => ({ itemId: i.itemId || i.sku, aiCount: i.aiCount, confidence: i.confidence, matchStatus: i.matchStatus, override: i.override, stageId: i.stageId, stageName: i.stageName })),
     }),
   });
   if (!res.ok) {
@@ -1056,22 +1085,26 @@ function resizeImageFile(file, maxDim = 1568, quality = 0.9) {
   });
 }
 
-const CaptureScreen = ({ locations, items, assignments, settings, navigate, onComplete }) => {
+const CaptureScreen = ({ locations, items, assignments, stages, setStages, settings, navigate, onComplete }) => {
   const [locId, setLocId] = useState(locations[0]?.id || "");
   const [areaId, setAreaId] = useState("");
   const [phase, setPhase] = useState("ready");
-  const [images, setImages] = useState([]);
+  const [stageList, setStageList] = useState([]); // [{ id, name, images: [] }]
   const [preview, setPreview] = useState(null);
   const [progress, setProgress] = useState(0);
+  const [stageProgressLabel, setStageProgressLabel] = useState("");
   const [resultCount, setResultCount] = useState(0);
+  const [photoCount, setPhotoCount] = useState(0);
   const [errorMsg, setErrorMsg] = useState("");
-  const fileRef = useRef(null); const camRef = useRef(null); const timerRef = useRef(null);
+  const fileRefs = useRef({}); const camRefs = useRef({});
   const [lastCount, setLastCount] = useState(null);
 
   const loc = locations.find(l => l.id === locId) || locations[0];
   const areas = loc?.areas || [];
   const area = areas.find(a => a.id === areaId) || areas[0];
-  const canProcess = images.length > 0 && phase === "ready" && !!area;
+  const totalImages = stageList.reduce((s, st) => s + st.images.length, 0);
+  const activeStageCount = stageList.filter(s => s.images.length > 0).length;
+  const canProcess = totalImages > 0 && phase === "ready" && !!area;
 
   useEffect(() => {
     if (!area) { setLastCount(null); return; }
@@ -1080,13 +1113,26 @@ const CaptureScreen = ({ locations, items, assignments, settings, navigate, onCo
     return () => { cancelled = true; };
   }, [area?.id]);
 
+  // Seed stages from what was persisted for this area last time -- names stick around session to session.
+  useEffect(() => {
+    if (!area) { setStageList([]); return; }
+    const persisted = stages.filter(s => s.areaId === area.id).sort((a, b) => a.sortOrder - b.sortOrder);
+    setStageList(persisted.length > 0
+      ? persisted.map(s => ({ id: s.id, name: s.name, images: [] }))
+      : [{ id: uid("stage"), name: "Stage 1", images: [] }]);
+  }, [area?.id]);
+
   // Area-scoped reference list for Claude
   const areaItems = area ? assignments
     .filter(a => a.locationId === loc.id && a.areaId === area.id)
     .map(a => { const it = items.find(i => i.id === a.itemId); return it ? { ...it, par: a.par } : null; })
     .filter(Boolean) : [];
 
-  const handleFiles = (files) => {
+  const addStage = () => setStageList(prev => [...prev, { id: uid("stage"), name: `Stage ${prev.length + 1}`, images: [] }]);
+  const removeStage = (stageId) => setStageList(prev => prev.length > 1 ? prev.filter(s => s.id !== stageId) : prev);
+  const renameStage = (stageId, name) => setStageList(prev => prev.map(s => s.id === stageId ? { ...s, name } : s));
+
+  const handleFiles = (stageId, files) => {
     const valid = Array.from(files).filter(f => f.type.startsWith("image/"));
     Promise.all(valid.map(async file => {
       try {
@@ -1094,46 +1140,96 @@ const CaptureScreen = ({ locations, items, assignments, settings, navigate, onCo
         const approxBytes = Math.round((dataUrl.length - dataUrl.indexOf(",") - 1) * 0.75);
         return { id: uid("img"), src: dataUrl, name: file.name, size: (approxBytes / 1024).toFixed(0) + " KB" };
       } catch {
-        // Fall back to the original file if resizing fails for any reason
         return new Promise(res => {
           const r = new FileReader();
           r.onload = e => res({ id: uid("img"), src: e.target.result, name: file.name, size: (file.size / 1024).toFixed(0) + " KB" });
           r.readAsDataURL(file);
         });
       }
-    })).then(imgs => setImages(prev => [...prev, ...imgs]));
+    })).then(imgs => setStageList(prev => prev.map(s => s.id === stageId ? { ...s, images: [...s.images, ...imgs].slice(0, 5) } : s)));
   };
+
+  const removeImage = (stageId, imgId) => setStageList(prev => prev.map(s => s.id === stageId ? { ...s, images: s.images.filter(i => i.id !== imgId) } : s));
 
   const doProcess = async () => {
     setErrorMsg("");
-    const totalBytes = images.reduce((sum, img) => sum + Math.round((img.src.length - img.src.indexOf(",") - 1) * 0.75), 0);
-    if (totalBytes > 4 * 1024 * 1024) {
-      setErrorMsg(`These photos are too large to send together (${(totalBytes / 1024 / 1024).toFixed(1)}MB). Try processing fewer photos at once.`);
-      setPhase("error");
-      return;
+    const activeStages = stageList.filter(s => s.images.length > 0);
+    if (activeStages.length === 0) return;
+
+    for (const s of activeStages) {
+      const bytes = s.images.reduce((sum, img) => sum + Math.round((img.src.length - img.src.indexOf(",") - 1) * 0.75), 0);
+      if (bytes > 4 * 1024 * 1024) {
+        setErrorMsg(`Photos in "${s.name}" are too large to send together (${(bytes / 1024 / 1024).toFixed(1)}MB). Remove a photo from that stage.`);
+        setPhase("error");
+        return;
+      }
     }
+
     setPhase("processing"); setProgress(0);
-    let p = 0;
-    timerRef.current = setInterval(() => { p = Math.min(p + (p < 40 ? 3 : p < 70 ? 1.5 : 0.5), 85); setProgress(Math.round(p)); }, 300);
+    const totalPhotos = activeStages.reduce((s, st) => s + st.images.length, 0);
+    setPhotoCount(totalPhotos);
+
+    // Persist stage names now, so they survive even if analysis fails partway through.
     try {
-      const backendResults = await analysePhotosViaBackend(images, area.id);
-      const results = adaptAnalysisResults(backendResults, areaItems);
-      clearInterval(timerRef.current); setProgress(100); setResultCount(results.length);
-      onComplete(results, { location: loc.name, locationId: loc.id, area: area.name, areaId: area.id, photoCount: images.length });
+      const saved = await saveStagesToBackend(area.id, activeStages.map((s, i) => ({ id: s.id, name: s.name, sortOrder: i })));
+      setStages(prev => {
+        const savedIds = new Set(saved.stages.map(sv => sv.id));
+        const others = prev.filter(p => !savedIds.has(p.id));
+        return [...others, ...saved.stages.map(sv => ({ id: sv.id, areaId: sv.area_id, name: sv.name, sortOrder: sv.sort_order }))];
+      });
+    } catch {
+      // Non-fatal -- names just won't persist for next time, the count can still proceed.
+    }
+
+    try {
+      const allResults = [];
+      for (let i = 0; i < activeStages.length; i++) {
+        const s = activeStages[i];
+        setStageProgressLabel(`Analysing "${s.name}" (${i + 1} of ${activeStages.length})…`);
+        setProgress(Math.round((i / activeStages.length) * 90));
+        const backendResults = await analysePhotosViaBackend(s.images, area.id);
+        const adapted = adaptAnalysisResults(backendResults, areaItems);
+        adapted.forEach(r => { r.stageId = s.id; r.stageName = s.name; });
+        allResults.push(...adapted);
+      }
+      setProgress(95);
+
+      // Merge across stages: an item seen in only one stage counts normally. An item seen in
+      // multiple stages gets flagged for manual review instead of auto-summed -- it may be the
+      // same physical stock double-counted, or genuinely be stored in two places.
+      const byItemId = new Map();
+      const finalResults = [];
+      for (const r of allResults) {
+        if (!r.itemId) { finalResults.push(r); continue; } // unrecognized items never dedupe
+        if (!byItemId.has(r.itemId)) byItemId.set(r.itemId, []);
+        byItemId.get(r.itemId).push(r);
+      }
+      for (const rows of byItemId.values()) {
+        if (rows.length === 1) { finalResults.push(rows[0]); continue; }
+        const breakdown = rows.map(r => `${r.stageName} (qty ${r.aiCount})`).join(", ");
+        finalResults.push({
+          ...rows[0],
+          key: uid("ci"),
+          aiCount: rows.reduce((s, r) => s + r.aiCount, 0),
+          confidence: Math.min(...rows.map(r => r.confidence)),
+          matchStatus: "cross_stage_conflict",
+          stageId: null,
+          stageName: rows.map(r => r.stageName).join(", "),
+          notes: `Seen in multiple stages: ${breakdown} — verify total to avoid double-counting`,
+        });
+      }
+
+      setProgress(100); setResultCount(finalResults.length);
+      onComplete(finalResults, { location: loc.name, locationId: loc.id, area: area.name, areaId: area.id, photoCount: totalPhotos, stageCount: activeStages.length });
       setTimeout(() => setPhase("done"), 400);
     } catch (e) {
-      clearInterval(timerRef.current); setProgress(0);
+      setProgress(0);
       setErrorMsg(e.message || "Analysis failed."); setPhase("error");
     }
   };
 
-  const label = progress < 15 ? "Sending photos to Claude Vision…" : progress < 40 ? "Identifying items…" : progress < 65 ? "Reading labels & codes…" : progress < 85 ? "Cross-referencing area list…" : "Finalising…";
-
   return (
     <div style={{ padding: "24px 16px 100px" }}>
-      <input ref={fileRef} type="file" accept="image/*" multiple style={{ display: "none" }} onChange={e => { handleFiles(e.target.files); e.target.value = ""; }} />
-      <input ref={camRef} type="file" accept="image/*" capture="environment" style={{ display: "none" }} onChange={e => { handleFiles(e.target.files); e.target.value = ""; }} />
-
       {preview && (
         <div onClick={() => setPreview(null)} style={{ position: "fixed", inset: 0, background: "#0d1b2aE6", zIndex: 400, display: "flex", alignItems: "center", justifyContent: "center", padding: 16 }}>
           <img src={preview} alt="" style={{ maxWidth: "100%", maxHeight: "85vh", borderRadius: 16 }} />
@@ -1141,7 +1237,7 @@ const CaptureScreen = ({ locations, items, assignments, settings, navigate, onCo
       )}
 
       <h1 style={{ fontSize: 24, fontWeight: 400, color: C.navy, margin: 0, fontFamily: "'DM Serif Display', serif" }}>Capture Count</h1>
-      <p style={{ fontSize: 13, color: C.textSub, margin: "4px 0 18px" }}>Take photos or upload from your library</p>
+      <p style={{ fontSize: 13, color: C.textSub, margin: "4px 0 18px" }}>Break the area into stages (shelves, walls, bays) — up to 5 photos each</p>
 
       {phase === "ready" && (
         <div style={{ display: "flex", flexDirection: "column", gap: 12, marginBottom: 18 }}>
@@ -1174,7 +1270,7 @@ const CaptureScreen = ({ locations, items, assignments, settings, navigate, onCo
         <div style={{ background: C.greenBg, border: `2px solid ${C.greenBorder}`, borderRadius: 18, padding: 26, textAlign: "center", marginBottom: 18 }}>
           <div style={{ width: 60, height: 60, borderRadius: "50%", background: "#fff", border: `2px solid ${C.green}`, display: "flex", alignItems: "center", justifyContent: "center", margin: "0 auto 12px" }}><Icon name="check" size={28} color={C.green} /></div>
           <p style={{ color: C.navy, fontWeight: 400, margin: 0, fontSize: 18, fontFamily: "'DM Serif Display', serif" }}>Analysis Complete</p>
-          <p style={{ color: C.textSub, fontSize: 13, margin: "6px 0 0" }}>Claude found <strong>{resultCount}</strong> item{resultCount !== 1 ? "s" : ""} across {images.length} photo{images.length !== 1 ? "s" : ""}</p>
+          <p style={{ color: C.textSub, fontSize: 13, margin: "6px 0 0" }}>Claude found <strong>{resultCount}</strong> item{resultCount !== 1 ? "s" : ""} across {photoCount} photo{photoCount !== 1 ? "s" : ""}</p>
         </div>
       )}
 
@@ -1190,13 +1286,13 @@ const CaptureScreen = ({ locations, items, assignments, settings, navigate, onCo
           <div style={{ textAlign: "center", marginBottom: 18 }}>
             <div style={{ width: 54, height: 54, borderRadius: "50%", border: `3px solid ${C.goldDim}`, borderTopColor: C.gold, animation: "spin 0.8s linear infinite", margin: "0 auto 12px" }} />
             <p style={{ color: C.navy, fontWeight: 400, margin: 0, fontSize: 16, fontFamily: "'DM Serif Display', serif" }}>AI Analysing…</p>
-            <p style={{ color: C.textSub, fontSize: 12, margin: "6px 0 0" }}>{label}</p>
+            <p style={{ color: C.textSub, fontSize: 12, margin: "6px 0 0" }}>{stageProgressLabel}</p>
           </div>
           <div style={{ height: 6, background: C.border, borderRadius: 3, overflow: "hidden", marginBottom: 8 }}>
             <div style={{ width: `${progress}%`, height: "100%", background: "linear-gradient(90deg,#d79e2d,#efc358)", borderRadius: 3, transition: "width 0.4s" }} />
           </div>
           <div style={{ display: "flex", justifyContent: "space-between" }}>
-            <span style={{ fontSize: 11, color: C.textMuted }}>{images.length} photo{images.length !== 1 ? "s" : ""}</span>
+            <span style={{ fontSize: 11, color: C.textMuted }}>{photoCount} photo{photoCount !== 1 ? "s" : ""}</span>
             <span style={{ fontSize: 11, color: C.gold, fontWeight: 700 }}>{progress}%</span>
           </div>
         </div>
@@ -1204,48 +1300,56 @@ const CaptureScreen = ({ locations, items, assignments, settings, navigate, onCo
 
       {phase === "ready" && (
         <>
-          {images.length === 0 ? (
-            <div onClick={() => fileRef.current?.click()} style={{ background: C.card, border: `2px dashed ${C.goldBorder}`, borderRadius: 18, aspectRatio: "4/3", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", cursor: "pointer", marginBottom: 14, gap: 10 }}>
-              <div style={{ width: 64, height: 64, borderRadius: 18, background: C.navy, display: "flex", alignItems: "center", justifyContent: "center" }}><Icon name="upload" size={30} color={C.gold} /></div>
-              <p style={{ color: C.navy, fontWeight: 400, fontSize: 15, margin: 0, fontFamily: "'DM Serif Display', serif" }}>Upload from Library</p>
-              <p style={{ color: C.textMuted, fontSize: 12, margin: 0 }}>Tap to browse · select multiple photos</p>
-            </div>
-          ) : (
-            <div style={{ marginBottom: 14 }}>
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
-                <p style={{ margin: 0, fontSize: 12, fontWeight: 700, color: C.textSub }}>{images.length} photo{images.length !== 1 ? "s" : ""} queued</p>
-                <button onClick={() => fileRef.current?.click()} style={{ background: "none", border: "none", color: C.gold, fontSize: 12, fontWeight: 700, cursor: "pointer" }}>+ Add More</button>
-              </div>
-              <div style={{ display: "flex", gap: 10, overflowX: "auto", paddingBottom: 4 }}>
-                {images.map((img, idx) => (
-                  <div key={img.id} style={{ flexShrink: 0, position: "relative" }}>
-                    <img src={img.src} alt="" onClick={() => setPreview(img.src)} style={{ width: 88, height: 88, borderRadius: 12, objectFit: "cover", border: `2px solid ${C.goldBorder}`, display: "block", cursor: "pointer" }} />
-                    <button onClick={() => setImages(prev => prev.filter(i => i.id !== img.id))} style={{ position: "absolute", top: -6, right: -6, width: 22, height: 22, borderRadius: "50%", background: C.red, border: "2px solid #fff", display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer" }}><Icon name="close" size={10} color="#fff" /></button>
-                    <div style={{ position: "absolute", top: 4, left: 4, width: 18, height: 18, borderRadius: "50%", background: C.navy, display: "flex", alignItems: "center", justifyContent: "center" }}><span style={{ fontSize: 9, color: C.gold, fontWeight: 800 }}>{idx + 1}</span></div>
-                  </div>
-                ))}
-              </div>
-            </div>
-          )}
+          <div style={{ display: "flex", flexDirection: "column", gap: 14, marginBottom: 14 }}>
+            {stageList.map((s, sidx) => (
+              <div key={s.id} style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 16, padding: 14, boxShadow: "0 1px 3px rgba(13,27,42,0.05)" }}>
+                <input ref={el => { if (el) fileRefs.current[s.id] = el; }} type="file" accept="image/*" multiple style={{ display: "none" }} onChange={e => { handleFiles(s.id, e.target.files); e.target.value = ""; }} />
+                <input ref={el => { if (el) camRefs.current[s.id] = el; }} type="file" accept="image/*" capture="environment" style={{ display: "none" }} onChange={e => { handleFiles(s.id, e.target.files); e.target.value = ""; }} />
 
-          <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-            <div style={{ display: "flex", gap: 10 }}>
-              <button onClick={() => camRef.current?.click()} style={{ flex: 1, background: C.card, border: `1px solid ${C.borderDark}`, color: C.textSub, borderRadius: 12, padding: "14px 10px", fontWeight: 700, fontSize: 13, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", gap: 8 }}><Icon name="camera" size={18} color={C.textSub} />New Photo</button>
-              <button onClick={() => fileRef.current?.click()} style={{ flex: 2, background: C.goldDim, border: `1px solid ${C.goldBorder}`, color: C.navy, borderRadius: 12, padding: "14px 10px", fontWeight: 800, fontSize: 13, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", gap: 8 }}><Icon name="upload" size={18} color={C.gold} />{images.length > 0 ? `Library (${images.length})` : "Upload from Library"}</button>
-            </div>
-            <PrimaryBtn onClick={doProcess} disabled={!canProcess}>
-              <span style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 10 }}>
-                <Icon name="ai" size={20} color={canProcess ? C.gold : C.textMuted} />
-                {canProcess ? `Analyse ${images.length} Photo${images.length !== 1 ? "s" : ""} with AI` : "Add photos to continue"}
-              </span>
-            </PrimaryBtn>
+                <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10 }}>
+                  <input value={s.name} onChange={e => renameStage(s.id, e.target.value)} placeholder={`Stage ${sidx + 1}`}
+                    style={{ flex: 1, background: C.cardAlt, border: `1px solid ${C.borderDark}`, borderRadius: 8, padding: "8px 10px", fontSize: 13, fontWeight: 700, color: C.navy, outline: "none", fontFamily: "'DM Sans', sans-serif" }} />
+                  {stageList.length > 1 && (
+                    <button onClick={() => removeStage(s.id)} style={{ background: C.redBg, border: `1px solid ${C.redBorder}`, borderRadius: 8, padding: "8px 10px", cursor: "pointer" }}><Icon name="trash" size={14} color={C.red} /></button>
+                  )}
+                </div>
+
+                {s.images.length > 0 && (
+                  <div style={{ display: "flex", gap: 8, overflowX: "auto", paddingBottom: 4, marginBottom: 10 }}>
+                    {s.images.map((img, idx) => (
+                      <div key={img.id} style={{ flexShrink: 0, position: "relative" }}>
+                        <img src={img.src} alt="" onClick={() => setPreview(img.src)} style={{ width: 72, height: 72, borderRadius: 10, objectFit: "cover", border: `2px solid ${C.goldBorder}`, display: "block", cursor: "pointer" }} />
+                        <button onClick={() => removeImage(s.id, img.id)} style={{ position: "absolute", top: -5, right: -5, width: 20, height: 20, borderRadius: "50%", background: C.red, border: "2px solid #fff", display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer" }}><Icon name="close" size={9} color="#fff" /></button>
+                        <div style={{ position: "absolute", top: 3, left: 3, width: 16, height: 16, borderRadius: "50%", background: C.navy, display: "flex", alignItems: "center", justifyContent: "center" }}><span style={{ fontSize: 8, color: C.gold, fontWeight: 800 }}>{idx + 1}</span></div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                <div style={{ display: "flex", gap: 8 }}>
+                  <button onClick={() => camRefs.current[s.id]?.click()} disabled={s.images.length >= 5} style={{ flex: 1, background: C.cardAlt, border: `1px solid ${C.borderDark}`, color: s.images.length >= 5 ? C.textMuted : C.textSub, borderRadius: 10, padding: "10px", fontWeight: 700, fontSize: 12, cursor: s.images.length >= 5 ? "not-allowed" : "pointer", display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }}><Icon name="camera" size={15} color={s.images.length >= 5 ? C.textMuted : C.textSub} />Photo</button>
+                  <button onClick={() => fileRefs.current[s.id]?.click()} disabled={s.images.length >= 5} style={{ flex: 1, background: s.images.length >= 5 ? C.border : C.goldDim, border: `1px solid ${C.goldBorder}`, color: C.navy, borderRadius: 10, padding: "10px", fontWeight: 700, fontSize: 12, cursor: s.images.length >= 5 ? "not-allowed" : "pointer", display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }}><Icon name="upload" size={15} color={C.gold} />{s.images.length}/5</button>
+                </div>
+              </div>
+            ))}
           </div>
+
+          <button onClick={addStage} style={{ width: "100%", background: C.cardAlt, border: `1px dashed ${C.borderDark}`, color: C.textSub, borderRadius: 12, padding: 12, fontWeight: 700, fontSize: 13, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", gap: 6, marginBottom: 18 }}>
+            <Icon name="plus" size={15} color={C.textSub} />Add Stage
+          </button>
+
+          <PrimaryBtn onClick={doProcess} disabled={!canProcess}>
+            <span style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 10 }}>
+              <Icon name="ai" size={20} color={canProcess ? C.gold : C.textMuted} />
+              {canProcess ? `Analyse ${totalImages} Photo${totalImages !== 1 ? "s" : ""} Across ${activeStageCount} Stage${activeStageCount !== 1 ? "s" : ""}` : "Add photos to continue"}
+            </span>
+          </PrimaryBtn>
         </>
       )}
 
       {(phase === "done" || phase === "error") && (
         <div style={{ display: "flex", gap: 10 }}>
-          <button onClick={() => { setImages([]); setPhase("ready"); setProgress(0); }} style={{ flex: 1, background: C.card, border: `1px solid ${C.borderDark}`, color: C.textSub, borderRadius: 12, padding: 16, fontWeight: 700, fontSize: 14, cursor: "pointer" }}>Start Over</button>
+          <button onClick={() => { setStageList(prev => prev.map(s => ({ ...s, images: [] }))); setPhase("ready"); setProgress(0); }} style={{ flex: 1, background: C.card, border: `1px solid ${C.borderDark}`, color: C.textSub, borderRadius: 12, padding: 16, fontWeight: 700, fontSize: 14, cursor: "pointer" }}>Start Over</button>
           {phase === "done" && <GoldBtn onClick={() => navigate("review")} style={{ flex: 2 }}>Review Count Sheet →</GoldBtn>}
           {phase === "error" && <PrimaryBtn onClick={doProcess} style={{ flex: 2 }}>Retry</PrimaryBtn>}
         </div>
@@ -1343,17 +1447,19 @@ const ReviewScreen = ({ navigate, countItems, setCountItems, countMeta, settings
       <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
         {list.map(item => {
           const count = item.override ?? item.aiCount;
-          const needsReview = item.confidence < threshold && item.matchStatus !== "not_found";
+          const needsReview = (item.confidence < threshold && item.matchStatus !== "not_found") || item.matchStatus === "cross_stage_conflict";
           const isEditing = editing === item.key;
           const nf = item.matchStatus === "not_found";
           return (
             <div key={item.key} style={{ background: nf ? C.cardAlt : C.card, border: `1px solid ${item.confirmed ? C.greenBorder : needsReview ? C.redBorder : C.border}`, borderRadius: 14, padding: 14, opacity: nf ? 0.75 : 1, boxShadow: "0 1px 3px rgba(13,27,42,0.05)" }}>
               <p style={{ margin: 0, fontSize: 13, fontWeight: 700, color: C.navy }}>{item.name}{item.size ? ` — ${item.size}` : ""}</p>
+              {item.stageName && <p style={{ margin: "2px 0 0", fontSize: 10, color: C.textMuted }}>📍 {item.stageName}</p>}
               {item.notes && <p style={{ margin: "3px 0 0", fontSize: 11, color: C.textSub, fontStyle: "italic" }}>"{item.notes}"</p>}
               <div style={{ display: "flex", gap: 5, marginTop: 6, flexWrap: "wrap" }}>
                 {item.matchStatus === "matched" && <Badge color={C.green}>✓ Label Match</Badge>}
                 {item.matchStatus === "visual_match" && <Badge color={C.amber}>👁 Visual Match</Badge>}
                 {item.matchStatus === "unknown" && <Badge color={C.red}>⚠ Not in Catalog</Badge>}
+                {item.matchStatus === "cross_stage_conflict" && <Badge color={C.blue}>⚠ Multiple Stages</Badge>}
                 {nf && <Badge color={C.textMuted}>📷 Not Seen</Badge>}
                 {needsReview && <Badge color={C.red}>Verify</Badge>}
                 {item.confirmed && <Badge color={C.green}>Confirmed</Badge>}
@@ -1549,6 +1655,7 @@ export default function App() {
   const [locations, setLocations] = useState([]);
   const [items, setItems] = useState([]);
   const [assignments, setAssignments] = useState([]);
+  const [stages, setStages] = useState([]);
   const [countItems, setCountItems] = useState([]);
   const [countMeta, setCountMeta] = useState(null);
   const [catalogState, setCatalogState] = useState("loading"); // loading | ready | error
@@ -1557,8 +1664,8 @@ export default function App() {
   const fetchCatalog = () => {
     setCatalogState("loading");
     loadCatalog()
-      .then(({ locations, items, assignments }) => {
-        setLocations(locations); setItems(items); setAssignments(assignments);
+      .then(({ locations, items, assignments, stages }) => {
+        setLocations(locations); setItems(items); setAssignments(assignments); setStages(stages);
         setCatalogState("ready");
       })
       .catch(e => { setCatalogError(e.message || "Could not load catalog"); setCatalogState("error"); });
@@ -1597,7 +1704,7 @@ export default function App() {
     dashboard: <Dashboard locations={locations} items={items} assignments={assignments} navigate={setScreen} />,
     sites:     <SitesScreen locations={locations} setLocations={setLocations} settings={settings} />,
     catalog:   <CatalogScreen items={items} setItems={setItems} assignments={assignments} setAssignments={setAssignments} locations={locations} settings={settings} setSettings={setSettings} />,
-    capture:   <CaptureScreen locations={locations} items={items} assignments={assignments} settings={settings} navigate={setScreen} onComplete={(r, m) => { setCountItems(r); setCountMeta(m); }} />,
+    capture:   <CaptureScreen locations={locations} items={items} assignments={assignments} stages={stages} setStages={setStages} settings={settings} navigate={setScreen} onComplete={(r, m) => { setCountItems(r); setCountMeta(m); }} />,
     review:    <ReviewScreen navigate={setScreen} countItems={countItems} setCountItems={setCountItems} countMeta={countMeta} settings={settings} items={items} setItems={setItems} assignments={assignments} setAssignments={setAssignments} />,
     orders:    <OrdersScreen countItems={countItems} items={items} assignments={assignments} />,
     settings:  <SettingsScreen settings={settings} setSettings={setSettings} />,
