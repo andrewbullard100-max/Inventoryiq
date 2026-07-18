@@ -1031,7 +1031,7 @@ const InvoiceModal = ({ onClose, onImport, existingSkus }) => {
 // than ~1568px on the long edge, and Vercel serverless functions hard-cap
 // request bodies at 4.5MB -- full-res phone photos (esp. multiple at once)
 // blow past that and get rejected with a 413 before our code even runs.
-function resizeImageFile(file, maxDim = 1568, quality = 0.82) {
+function resizeImageFile(file, maxDim = 1568, quality = 0.9) {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
     reader.onerror = () => reject(new Error("Could not read file"));

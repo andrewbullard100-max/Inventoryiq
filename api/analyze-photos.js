@@ -97,14 +97,18 @@ export default async function handler(req, res) {
     const promptItemList = areaItems.map(({ referenceImageUrl, ...rest }) => rest); // don't dump raw URLs into the prompt text
     const systemPrompt = `You are an inventory counting assistant for a foodservice operation. You will be shown one or more photos of a single storage area. Your job is to count how many of each item you can see, matching ONLY against the item list provided below -- do not invent items that are not on this list.
 
-${referenceBlocks.length > 0 ? `Before the storage area photo(s), you will also be shown reference photos for a few specific items on the list (each one labeled with its itemId). Use these to visually confirm a match when the label is unclear or the packaging is generic -- these are items that have been historically hard to identify from text/label alone.\n\n` : ''}For every item you can identify in the photo(s), report:
+${referenceBlocks.length > 0 ? `Before the storage area photo(s), you will also be shown reference photos for a few specific items on the list (each one labeled with its itemId). Use these to visually confirm a match when the label is unclear or the packaging is generic -- these are items that have been historically hard to identify from text/label alone.\n\n` : ''}IMPORTANT -- the photos may overlap the same physical shelf space (e.g. a wide shelf photographed in two overlapping shots). Before counting, first identify which items appear in more than one photo -- treat those as the SAME physical unit(s), not separate ones. Never sum a per-photo count across photos for an item that could be the same physical stock.
+
+Within a single photo, look carefully for multiple identical items stacked or placed side by side -- boxes of the same product are often grouped together, and it's easy to undercount them at a glance. Count every visible unit of a matched product, not just the first one you notice.
+
+For every item you can identify, report:
 - itemId (must exactly match an id from the list below)
-- count (your best count of units/cases visible; use the item's stated order unit)
+- count (your best count of physical units/cases actually present, after deduplicating across overlapping photos; use the item's stated order unit)
 - confidence (0.0-1.0, how sure you are of both the identification and the count)
 
 If you see something on shelf that is clearly inventory but does NOT match any item on the list, include it in "unrecognizedItems" with a short description instead of an itemId.
 
-Respond with ONLY valid JSON, no other text, in this exact shape:
+Work through the photos step by step first: note what shelf/area each photo covers, which items repeat across photos, and how many of each distinct item you can actually count. Use printed vendor codes, item numbers, or other label text to disambiguate near-identical packaging where possible. Then, once you've reasoned through it, end your response with a line containing only "FINAL ANSWER:" followed by valid JSON in this exact shape and nothing else after it:
 {
   "counts": [ { "itemId": "string", "count": number, "confidence": number } ],
   "unrecognizedItems": [ { "description": "string", "confidence": number } ]
@@ -132,7 +136,7 @@ ${JSON.stringify(promptItemList, null, 2)}`;
       },
       body: JSON.stringify({
         model: MODEL,
-        max_tokens: 4096,
+        max_tokens: 8192,
         system: systemPrompt,
         messages: [
           {
@@ -140,7 +144,7 @@ ${JSON.stringify(promptItemList, null, 2)}`;
             content: [
               ...referenceBlocks,
               ...imageBlocks,
-              { type: 'text', text: 'Count the items in the storage area photo(s) above per your instructions and respond with the JSON only.' },
+              { type: 'text', text: 'Count the items in the storage area photo(s) above per your instructions. Reason through it first, then end with "FINAL ANSWER:" followed by the JSON.' },
             ],
           },
         ],
@@ -162,7 +166,10 @@ ${JSON.stringify(promptItemList, null, 2)}`;
 
     let parsed;
     try {
-      const cleaned = textBlock.text.replace(/```json|```/g, '').trim();
+      const raw = textBlock.text;
+      const markerIdx = raw.lastIndexOf('FINAL ANSWER:');
+      const afterMarker = markerIdx >= 0 ? raw.slice(markerIdx + 'FINAL ANSWER:'.length) : raw;
+      const cleaned = afterMarker.replace(/```json|```/g, '').trim();
       parsed = JSON.parse(cleaned);
     } catch (e) {
       res.status(502).json({ error: 'Could not parse Claude response as JSON', raw: textBlock.text });
