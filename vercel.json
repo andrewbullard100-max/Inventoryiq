@@ -1,0 +1,11 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "functions": {
+    "api/analyze-photos.js": {
+      "maxDuration": 60
+    },
+    "api/parse-invoice.js": {
+      "maxDuration": 60
+    }
+  }
+}
