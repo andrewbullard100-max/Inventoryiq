@@ -1,41 +1,34 @@
 // /api/count-session
 //
-// Consolidates what used to be 4 separate endpoints (start-count, create-photo-upload-url,
-// record-stage-photos, resume-count) into one file. Reason: Vercel's Hobby plan caps a
-// deployment at 12 Serverless Functions, and this project was already at 11 -- adding 4 new
-// files for the storage-upload/progressive-persistence work pushed it to 15 and the
-// deployment failed outright. One file, routed by `action`, keeps the same functionality
-// at a net cost of +1 function instead of +4.
+// Consolidated (see org.js/catalog-write.js for the same pattern) to stay within Vercel
+// Hobby's 12-Serverless-Function cap.
 //
-// GET  /api/count-session?areaId=area_xxx&deviceId=dev_xxx
-//   -> resume: returns an in-progress count for this area (if any), with everything
-//      persisted for it so far, so the frontend can offer to pick up where it left off.
-//      If a DIFFERENT device already has this area's count in progress, returns
-//      { resumable: false, activeElsewhere: true, startedAt } instead of handing it over --
-//      see the multi-user collision note on handleStart below.
+// GET  /api/count-session?areaId=area_xxx
+//   -> resume: returns an in-progress count for this area (if any) in the caller's
+//      organization, so the frontend can offer to pick up where it left off. If a
+//      DIFFERENT user already has this area's count in progress, returns
+//      { resumable: false, activeElsewhere: true, startedAt } instead of handing it over.
 //
-// POST /api/count-session   body: { action: "start", areaId, deviceId, force? }
-//   -> creates (or reuses) an in-progress `counts` row for this area. Two devices can no
-//      longer collide on the same session silently: if another device's session is already
-//      in progress here, this returns 409 { collision: true } unless force is set, in which
-//      case the other device's session is marked abandoned and a fresh one is started. This
-//      is a lightweight stand-in for real per-user ownership -- there's no auth system yet,
-//      so "device" is just a persisted browser-local id, not a verified identity.
+// POST /api/count-session   body: { action: "start", areaId, force? }
+//   -> creates (or reuses) an in-progress `counts` row for this area, attributed to the
+//      caller's verified user id (started_by). If a different user's session is already in
+//      progress here, returns 409 { collision: true } unless force is set, in which case
+//      their session is marked abandoned and a fresh one is started. This used to be keyed
+//      on a client-supplied, spoofable localStorage "deviceId" before auth existed -- now
+//      it's the actual authenticated user, which is what the original collision fix should
+//      have been grounded in.
 //
 // POST /api/count-session   body: { action: "upload-url", areaId, stageId, mediaType }
-//   -> returns a signed Storage upload URL/token for one photo. The browser uploads
-//      directly to Storage with it -- the photo bytes never pass through this function.
+//   -> returns a signed Storage upload URL/token for one photo.
 //
 // POST /api/count-session   body: { action: "record-photos", countId, photos: [{storagePath, sha256, stageId}] }
-//   -> writes count_photos rows right after each photo finishes uploading, independent of
-//      whether AI analysis subsequently succeeds (the audit trail shouldn't depend on that).
-//      stageId is stored per-photo so the audit trail can tell which stage each photo
-//      belongs to (used by GET resume above to group photos correctly).
+//   -> writes count_photos rows right after each photo finishes uploading.
 //
 // POST /api/count-session   body: { action: "abandon", countId }
 //   -> marks an in-progress count abandoned so "Start Over" doesn't keep reusing it.
 
 import { getSupabaseAdmin } from './_lib/supabase.js';
+import { requireAuth, requireOrgMembership, respondToAuthError, HttpError } from './_lib/auth.js';
 
 const PHOTO_BUCKET = 'count-photos';
 
@@ -45,36 +38,44 @@ function extFor(mediaType) {
   return 'jpg';
 }
 
-async function handleResume(req, res, supabase) {
-  const { areaId, deviceId } = req.query || {};
-  if (!areaId || typeof areaId !== 'string') {
-    res.status(400).json({ error: 'areaId is required' });
-    return;
-  }
+// Every handler below takes an areaId at some point (directly, or via a countId lookup) --
+// this confirms it belongs to the caller's org before anything reads/writes against it, so
+// one org can never see or touch another org's count data via a guessed/reused id.
+async function assertAreaInOrg(supabase, areaId, orgId) {
+  const { data, error } = await supabase.from('areas').select('id').eq('id', areaId).eq('organization_id', orgId).maybeSingle();
+  if (error) throw new HttpError(500, 'Failed to verify area');
+  if (!data) throw new HttpError(404, 'Area not found in your organization');
+}
+
+async function assertCountInOrg(supabase, countId, orgId) {
+  const { data, error } = await supabase.from('counts').select('id, area_id').eq('id', countId).eq('organization_id', orgId).maybeSingle();
+  if (error) throw new HttpError(500, 'Failed to verify count session');
+  if (!data) throw new HttpError(404, 'Count session not found in your organization');
+  return data;
+}
+
+async function handleResume(req, res, supabase, auth) {
+  const { areaId } = req.query || {};
+  if (!areaId || typeof areaId !== 'string') throw new HttpError(400, 'areaId is required');
+  await assertAreaInOrg(supabase, areaId, auth.orgId);
 
   const { data: count, error: countErr } = await supabase
     .from('counts')
     .select('id, started_at, started_by')
     .eq('area_id', areaId)
+    .eq('organization_id', auth.orgId)
     .eq('status', 'in_progress')
     .order('started_at', { ascending: false })
     .limit(1)
     .maybeSingle();
 
-  if (countErr) {
-    res.status(500).json({ error: 'Failed to look up in-progress count', details: countErr.message });
-    return;
-  }
-  if (!count) {
-    res.status(200).json({ resumable: false });
-    return;
-  }
+  if (countErr) throw new HttpError(500, 'Failed to look up in-progress count');
+  if (!count) { res.status(200).json({ resumable: false }); return; }
 
-  // Someone else's device already has this area's count in progress -- don't hand it to this
-  // device as "resumable" (that's the multi-user collision: two people's photos/results
-  // silently intermingling in the same session). Tell the frontend it's active elsewhere
-  // instead, so it can show that rather than an offer to continue.
-  if (count.started_by && deviceId && count.started_by !== deviceId) {
+  // Someone else in the org already has this area's count in progress -- don't hand it to
+  // this user as "resumable" (that's the multi-user collision: two people's photos/results
+  // silently intermingling in the same session).
+  if (count.started_by && count.started_by !== auth.userId) {
     res.status(200).json({ resumable: false, activeElsewhere: true, startedAt: count.started_at });
     return;
   }
@@ -83,11 +84,7 @@ async function handleResume(req, res, supabase) {
     supabase.from('count_items').select('id, item_id, ai_count, confidence, match_status, stage_id, stage_name').eq('count_id', count.id),
     supabase.from('count_photos').select('id, stage_id, storage_path, sha256_hash, captured_at').eq('count_id', count.id),
   ]);
-
-  if (itemsErr || photosErr) {
-    res.status(500).json({ error: 'Failed to load in-progress count details', details: itemsErr?.message || photosErr?.message });
-    return;
-  }
+  if (itemsErr || photosErr) throw new HttpError(500, 'Failed to load in-progress count details');
 
   const stageIds = [...new Set([...(items || []).map(i => i.stage_id), ...(photos || []).map(p => p.stage_id)].filter(Boolean))];
 
@@ -101,57 +98,37 @@ async function handleResume(req, res, supabase) {
   });
 }
 
-async function handleStart(req, res, supabase) {
-  const { areaId, deviceId, force } = req.body || {};
-  if (!areaId || typeof areaId !== 'string') {
-    res.status(400).json({ error: 'areaId is required' });
-    return;
-  }
+async function handleStart(req, res, supabase, auth) {
+  const { areaId, force } = req.body || {};
+  if (!areaId || typeof areaId !== 'string') throw new HttpError(400, 'areaId is required');
+  await assertAreaInOrg(supabase, areaId, auth.orgId);
 
   const { data: existing, error: findErr } = await supabase
     .from('counts')
     .select('id, started_by, started_at')
     .eq('area_id', areaId)
+    .eq('organization_id', auth.orgId)
     .eq('status', 'in_progress')
     .order('started_at', { ascending: false })
     .limit(1)
     .maybeSingle();
-
-  if (findErr) {
-    res.status(500).json({ error: 'Failed to check for an existing in-progress count', details: findErr.message });
-    return;
-  }
+  if (findErr) throw new HttpError(500, 'Failed to check for an existing in-progress count');
 
   if (existing) {
-    const belongsToSomeoneElse = existing.started_by && deviceId && existing.started_by !== deviceId;
+    const belongsToSomeoneElse = existing.started_by && existing.started_by !== auth.userId;
 
     if (belongsToSomeoneElse && !force) {
-      // Two people counting the same area at once used to silently share one session. Now
-      // the second device is told explicitly and has to choose to take over, rather than its
-      // photos and AI results quietly getting mixed into the first device's count.
-      res.status(409).json({
-        error: 'Another device is already counting this area',
-        collision: true,
-        countId: existing.id,
-        startedAt: existing.started_at,
-      });
+      res.status(409).json({ error: 'Someone else is already counting this area', collision: true, countId: existing.id, startedAt: existing.started_at });
       return;
     }
 
     if (belongsToSomeoneElse && force) {
-      // Explicit takeover: retire the other device's session (kept, not deleted -- audit
+      // Explicit takeover: retire the other user's session (kept, not deleted -- audit
       // trail) and start a fresh one rather than mutating a session that isn't ours.
       const { error: abandonErr } = await supabase.from('counts').update({ status: 'abandoned' }).eq('id', existing.id);
-      if (abandonErr) {
-        res.status(500).json({ error: 'Failed to release the other device\'s count', details: abandonErr.message });
-        return;
-      }
+      if (abandonErr) throw new HttpError(500, 'Failed to release the other session');
     } else {
-      // Same device resuming (or a pre-existing row from before started_by was tracked) --
-      // claim/confirm ownership and hand it back.
-      if (!existing.started_by && deviceId) {
-        await supabase.from('counts').update({ started_by: deviceId }).eq('id', existing.id);
-      }
+      if (!existing.started_by) await supabase.from('counts').update({ started_by: auth.userId }).eq('id', existing.id);
       res.status(200).json({ countId: existing.id, resumed: true });
       return;
     }
@@ -159,71 +136,43 @@ async function handleStart(req, res, supabase) {
 
   const { data: created, error: createErr } = await supabase
     .from('counts')
-    .insert({ area_id: areaId, status: 'in_progress', started_by: deviceId || null })
+    .insert({ area_id: areaId, organization_id: auth.orgId, status: 'in_progress', started_by: auth.userId })
     .select('id')
     .single();
-
-  if (createErr) {
-    res.status(500).json({ error: 'Failed to start count', details: createErr.message });
-    return;
-  }
+  if (createErr) throw new HttpError(500, 'Failed to start count');
 
   res.status(200).json({ countId: created.id, resumed: false });
 }
 
-// POST /api/count-session   body: { action: "abandon", countId }
-//   -> marks an in-progress count session abandoned (never deleted -- keeps the audit
-//      trail intact) so "Start Over" doesn't keep writing into the same stale countId,
-//      and so a later visit to this area doesn't offer to "resume" it.
-async function handleAbandon(req, res, supabase) {
+async function handleAbandon(req, res, supabase, auth) {
   const { countId } = req.body || {};
-  if (!countId || typeof countId !== 'string') {
-    res.status(400).json({ error: 'countId is required' });
-    return;
-  }
+  if (!countId || typeof countId !== 'string') throw new HttpError(400, 'countId is required');
+  await assertCountInOrg(supabase, countId, auth.orgId);
 
   const { data, error } = await supabase
-    .from('counts')
-    .update({ status: 'abandoned' })
-    .eq('id', countId)
-    .eq('status', 'in_progress')
-    .select('id');
-
-  if (error) {
-    res.status(500).json({ error: 'Failed to abandon count', details: error.message });
-    return;
-  }
+    .from('counts').update({ status: 'abandoned' }).eq('id', countId).eq('status', 'in_progress').select('id');
+  if (error) throw new HttpError(500, 'Failed to abandon count');
 
   res.status(200).json({ abandoned: (data || []).length > 0 });
 }
 
-async function handleUploadUrl(req, res, supabase) {
+async function handleUploadUrl(req, res, supabase, auth) {
   const { areaId, stageId, mediaType } = req.body || {};
-  if (!areaId || !stageId || !mediaType) {
-    res.status(400).json({ error: 'areaId, stageId, and mediaType are required' });
-    return;
-  }
+  if (!areaId || !stageId || !mediaType) throw new HttpError(400, 'areaId, stageId, and mediaType are required');
+  await assertAreaInOrg(supabase, areaId, auth.orgId);
 
   const path = `${areaId}/${stageId}/${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${extFor(mediaType)}`;
   const { data, error } = await supabase.storage.from(PHOTO_BUCKET).createSignedUploadUrl(path);
-  if (error) {
-    res.status(500).json({ error: 'Failed to create upload URL', details: error.message });
-    return;
-  }
+  if (error) throw new HttpError(500, 'Failed to create upload URL');
 
   res.status(200).json({ path: data.path, token: data.token, bucket: PHOTO_BUCKET });
 }
 
-async function handleRecordPhotos(req, res, supabase) {
+async function handleRecordPhotos(req, res, supabase, auth) {
   const { countId, photos } = req.body || {};
-  if (!countId || typeof countId !== 'string') {
-    res.status(400).json({ error: 'countId is required' });
-    return;
-  }
-  if (!Array.isArray(photos) || photos.length === 0) {
-    res.status(400).json({ error: 'photos must be a non-empty array' });
-    return;
-  }
+  if (!countId || typeof countId !== 'string') throw new HttpError(400, 'countId is required');
+  if (!Array.isArray(photos) || photos.length === 0) throw new HttpError(400, 'photos must be a non-empty array');
+  await assertCountInOrg(supabase, countId, auth.orgId);
 
   const rows = photos.map((p) => ({
     count_id: countId,
@@ -233,10 +182,7 @@ async function handleRecordPhotos(req, res, supabase) {
   }));
 
   const { error } = await supabase.from('count_photos').insert(rows);
-  if (error) {
-    res.status(500).json({ error: 'Failed to record photos', details: error.message });
-    return;
-  }
+  if (error) throw new HttpError(500, 'Failed to record photos');
 
   res.status(200).json({ recorded: rows.length });
 }
@@ -244,24 +190,24 @@ async function handleRecordPhotos(req, res, supabase) {
 export default async function handler(req, res) {
   try {
     const supabase = getSupabaseAdmin();
+    const auth = await requireAuth(req, supabase);
+    requireOrgMembership(auth);
 
-    if (req.method === 'GET') {
-      await handleResume(req, res, supabase);
-      return;
-    }
+    if (req.method === 'GET') { await handleResume(req, res, supabase, auth); return; }
 
     if (req.method === 'POST') {
       const { action } = req.body || {};
-      if (action === 'start') { await handleStart(req, res, supabase); return; }
-      if (action === 'upload-url') { await handleUploadUrl(req, res, supabase); return; }
-      if (action === 'record-photos') { await handleRecordPhotos(req, res, supabase); return; }
-      if (action === 'abandon') { await handleAbandon(req, res, supabase); return; }
+      if (action === 'start') { await handleStart(req, res, supabase, auth); return; }
+      if (action === 'upload-url') { await handleUploadUrl(req, res, supabase, auth); return; }
+      if (action === 'record-photos') { await handleRecordPhotos(req, res, supabase, auth); return; }
+      if (action === 'abandon') { await handleAbandon(req, res, supabase, auth); return; }
       res.status(400).json({ error: 'Unknown or missing action. Expected one of: start, upload-url, record-photos, abandon' });
       return;
     }
 
     res.status(405).json({ error: 'Method not allowed' });
   } catch (err) {
+    if (respondToAuthError(res, err)) return;
     res.status(500).json({ error: 'Unexpected server error', details: err.message });
   }
 }

@@ -34,6 +34,7 @@
 //     set of what was actually detected across every stage, is the fix.
 
 import { getSupabaseAdmin } from './_lib/supabase.js';
+import { requireAuth, requireOrgMembership, respondToAuthError, HttpError } from './_lib/auth.js';
 
 export default async function handler(req, res) {
   if (req.method !== 'POST') {
@@ -42,6 +43,10 @@ export default async function handler(req, res) {
   }
 
   try {
+    const supabase = getSupabaseAdmin();
+    const auth = await requireAuth(req, supabase);
+    requireOrgMembership(auth);
+
     const { countId, areaId, requireApproval, finalItems } = req.body || {};
 
     if (!countId || typeof countId !== 'string') {
@@ -57,14 +62,14 @@ export default async function handler(req, res) {
       return;
     }
 
-    const supabase = getSupabaseAdmin();
-
-    // Sanity check: don't finalize a count that isn't ours / isn't in_progress. Prevents
-    // double-finalizing (e.g. a retried request) from corrupting an already-locked count.
+    // Sanity check: don't finalize a count that isn't ours / isn't in_progress / isn't in
+    // the caller's organization. Prevents double-finalizing (e.g. a retried request) from
+    // corrupting an already-locked count, and prevents finalizing another org's count.
     const { data: existingCount, error: countFetchErr } = await supabase
       .from('counts')
       .select('id, status')
       .eq('id', countId)
+      .eq('organization_id', auth.orgId)
       .single();
 
     if (countFetchErr || !existingCount) {
@@ -127,7 +132,7 @@ export default async function handler(req, res) {
     const now = new Date().toISOString();
     const { error: statusErr } = await supabase
       .from('counts')
-      .update({ status, finalized_at: status === 'approved' ? now : null })
+      .update({ status, finalized_at: status === 'approved' ? now : null, finalized_by: auth.userId })
       .eq('id', countId);
 
     if (statusErr) {
@@ -137,6 +142,7 @@ export default async function handler(req, res) {
 
     res.status(200).json({ countId, status, itemCount: finalItems.length });
   } catch (err) {
+    if (respondToAuthError(res, err)) return;
     res.status(500).json({ error: 'Unexpected server error', details: err.message });
   }
 }

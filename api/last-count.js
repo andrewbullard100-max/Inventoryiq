@@ -6,6 +6,7 @@
 // the new photo-based count even runs.
 
 import { getSupabaseAdmin } from './_lib/supabase.js';
+import { requireAuth, requireOrgMembership, respondToAuthError } from './_lib/auth.js';
 
 export default async function handler(req, res) {
   if (req.method !== 'GET') {
@@ -14,18 +15,21 @@ export default async function handler(req, res) {
   }
 
   try {
+    const supabase = getSupabaseAdmin();
+    const auth = await requireAuth(req, supabase);
+    requireOrgMembership(auth);
+
     const { areaId } = req.query || {};
     if (!areaId || typeof areaId !== 'string') {
       res.status(400).json({ error: 'areaId query param is required' });
       return;
     }
 
-    const supabase = getSupabaseAdmin();
-
     const { data: counts, error: countErr } = await supabase
       .from('counts')
       .select('id, status, started_at, finalized_at')
       .eq('area_id', areaId)
+      .eq('organization_id', auth.orgId)
       .in('status', ['approved', 'submitted'])
       .order('finalized_at', { ascending: false, nullsFirst: false })
       .order('started_at', { ascending: false })
@@ -76,6 +80,7 @@ export default async function handler(req, res) {
       },
     });
   } catch (err) {
+    if (respondToAuthError(res, err)) return;
     res.status(500).json({ error: 'Unexpected server error', details: err.message });
   }
 };

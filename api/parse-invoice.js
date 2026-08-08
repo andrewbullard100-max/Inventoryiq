@@ -13,6 +13,9 @@
 // it returns extracted items for the frontend's existing invoice-import
 // review flow to confirm before saving.
 
+import { getSupabaseAdmin } from './_lib/supabase.js';
+import { requireAuth, requireOrgMembership, requireManager, respondToAuthError } from './_lib/auth.js';
+
 const ANTHROPIC_API_URL = 'https://api.anthropic.com/v1/messages';
 const MODEL = 'claude-sonnet-5';
 
@@ -52,6 +55,11 @@ export default async function handler(req, res) {
   }
 
   try {
+    const supabase = getSupabaseAdmin();
+    const auth = await requireAuth(req, supabase);
+    requireOrgMembership(auth);
+    requireManager(auth); // invoice import feeds catalog edits, which are manager-only
+
     const { mediaType, data, csvText } = req.body || {};
 
     let userContent;
@@ -112,6 +120,7 @@ export default async function handler(req, res) {
 
     res.status(200).json({ items: parsed.items || [], model: MODEL });
   } catch (err) {
+    if (respondToAuthError(res, err)) return;
     res.status(500).json({ error: 'Unexpected server error', details: err.message });
   }
 };

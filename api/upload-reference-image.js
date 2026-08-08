@@ -7,6 +7,7 @@
 // only for items that actually need it, not the whole catalog.
 
 import { getSupabaseAdmin } from './_lib/supabase.js';
+import { requireAuth, requireOrgMembership, requireManager, respondToAuthError, HttpError } from './_lib/auth.js';
 
 const BUCKET = 'item-references';
 
@@ -31,13 +32,22 @@ export default async function handler(req, res) {
   }
 
   try {
+    const supabase = getSupabaseAdmin();
+    const auth = await requireAuth(req, supabase);
+    requireOrgMembership(auth);
+    requireManager(auth); // reference photos are a catalog edit
+
     const { itemId, mediaType, data } = req.body || {};
     if (!itemId || !mediaType || !data) {
       res.status(400).json({ error: 'itemId, mediaType, and data are required' });
       return;
     }
 
-    const supabase = getSupabaseAdmin();
+    const { data: itemCheck, error: itemCheckErr } = await supabase
+      .from('items').select('id').eq('id', itemId).eq('organization_id', auth.orgId).maybeSingle();
+    if (itemCheckErr) throw new HttpError(500, 'Failed to verify item ownership');
+    if (!itemCheck) throw new HttpError(404, 'Item not found in your organization');
+
     await ensureBucket(supabase);
 
     const buffer = Buffer.from(data, 'base64');
@@ -58,7 +68,8 @@ export default async function handler(req, res) {
     const { error: updateErr } = await supabase
       .from('items')
       .update({ reference_image_url: url })
-      .eq('id', itemId);
+      .eq('id', itemId)
+      .eq('organization_id', auth.orgId);
 
     if (updateErr) {
       res.status(500).json({ error: 'Image uploaded but failed to link to item', details: updateErr.message });
@@ -67,6 +78,7 @@ export default async function handler(req, res) {
 
     res.status(200).json({ url });
   } catch (err) {
+    if (respondToAuthError(res, err)) return;
     res.status(500).json({ error: 'Unexpected server error', details: err.message });
   }
 }

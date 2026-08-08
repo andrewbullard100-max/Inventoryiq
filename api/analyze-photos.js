@@ -26,6 +26,7 @@
 //      the browser tab survives to see the response.
 
 import { getSupabaseAdmin } from './_lib/supabase.js';
+import { requireAuth, requireOrgMembership, respondToAuthError, HttpError } from './_lib/auth.js';
 
 const ANTHROPIC_API_URL = 'https://api.anthropic.com/v1/messages';
 const MODEL = 'claude-sonnet-5';
@@ -39,6 +40,10 @@ export default async function handler(req, res) {
   }
 
   try {
+    const supabase = getSupabaseAdmin();
+    const auth = await requireAuth(req, supabase);
+    requireOrgMembership(auth);
+
     const { areaId, countId, stageId, stageName, storagePaths } = req.body || {};
 
     if (!areaId || typeof areaId !== 'string') {
@@ -62,7 +67,16 @@ export default async function handler(req, res) {
       return;
     }
 
-    const supabase = getSupabaseAdmin();
+    // Both the area and the count session must belong to the caller's organization --
+    // otherwise one org could analyze photos against another org's item catalog (areaId)
+    // or write results into another org's count (countId) just by guessing/reusing an id.
+    const [{ data: areaCheck, error: areaCheckErr }, { data: countCheck, error: countCheckErr }] = await Promise.all([
+      supabase.from('areas').select('id').eq('id', areaId).eq('organization_id', auth.orgId).maybeSingle(),
+      supabase.from('counts').select('id').eq('id', countId).eq('organization_id', auth.orgId).maybeSingle(),
+    ]);
+    if (areaCheckErr || countCheckErr) { res.status(500).json({ error: 'Failed to verify area/count ownership' }); return; }
+    if (!areaCheck) { res.status(404).json({ error: 'Area not found in your organization' }); return; }
+    if (!countCheck) { res.status(404).json({ error: 'Count session not found in your organization' }); return; }
 
     // 0. Pull this stage's photos down from Storage. Fail the whole request if any is
     //    missing -- an incomplete photo set shouldn't silently produce a partial count.
@@ -288,6 +302,7 @@ ${JSON.stringify(promptItemList, null, 2)}`;
       persisted: true,
     });
   } catch (err) {
+    if (respondToAuthError(res, err)) return;
     res.status(500).json({ error: 'Unexpected server error', details: err.message });
   }
 };

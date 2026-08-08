@@ -39,17 +39,6 @@ const EASE = "cubic-bezier(0.22, 1, 0.36, 1)";
 
 const uid = (p = "id") => p + "-" + Math.random().toString(36).slice(2, 8);
 
-// A lightweight per-browser device identifier -- NOT a real user/auth system, just enough to
-// tell two concurrent devices/tabs apart so they don't silently collide on the same count
-// session (see startCountSession / handleStart). Persisted so the same browser is recognized
-// as "the same session owner" across reloads.
-function getDeviceId() {
-  try {
-    let id = localStorage.getItem("iiq_device_id");
-    if (!id) { id = (crypto.randomUUID ? crypto.randomUUID() : uid("dev")); localStorage.setItem("iiq_device_id", id); }
-    return id;
-  } catch { return uid("dev"); } // localStorage unavailable (private mode etc) -- degrade to a per-load id
-}
 
 // ─── Area suggestions per industry (all user-editable) ───────────────────────
 const AREA_SUGGESTIONS = {
@@ -210,6 +199,32 @@ const GoldBtn = ({ children, onClick, disabled, style = {} }) => (
   <button onClick={onClick} disabled={disabled} style={{ background: disabled ? C.border : C.goldGradient, border: "none", color: disabled ? C.textMuted : C.navy, borderRadius: 9, padding: 16, fontWeight: 700, fontSize: 15, cursor: disabled ? "not-allowed" : "pointer", fontFamily: "'DM Sans', sans-serif", boxShadow: disabled ? "none" : "0 8px 20px rgba(201,168,76,0.28)", ...style }}>{children}</button>
 );
 
+// ─── Supabase Auth (browser client) ──────────────────────────────────────────
+// The SAME browser client used for photo Storage uploads now also handles sign-in/sign-up
+// and session storage -- it's initialized with the public anon key (safe to expose), never
+// the service role key, which stays server-side. Session persistence is left on (default),
+// so a signed-in person stays signed in across reloads.
+let _sb = null;
+function getSupabaseBrowserClient() {
+  if (_sb) return _sb;
+  const url = import.meta.env.VITE_SUPABASE_URL;
+  const key = import.meta.env.VITE_SUPABASE_ANON_KEY;
+  if (!url || !key) throw new Error("Auth isn't configured yet (missing VITE_SUPABASE_URL / VITE_SUPABASE_ANON_KEY).");
+  _sb = createClient(url, key);
+  return _sb;
+}
+
+// Every API call in this file goes through here instead of raw fetch(), so the caller's
+// Supabase Auth access token is attached automatically. Every API route except /api/health
+// now requires it -- a request without a valid, current session token gets a 401 back.
+async function apiFetch(path, options = {}) {
+  const sb = getSupabaseBrowserClient();
+  const { data: { session } } = await sb.auth.getSession();
+  const headers = { ...(options.headers || {}) };
+  if (session?.access_token) headers.Authorization = `Bearer ${session.access_token}`;
+  return fetch(path, { ...options, headers });
+}
+
 // ─── Backend proxy: Claude Vision photo analysis (area-scoped) ──────────────
 // Calls YOUR backend (/api/analyze-photos), never Anthropic directly -- the
 // backend holds the item list for this area itself, keyed by areaId. Photos
@@ -221,7 +236,7 @@ const GoldBtn = ({ children, onClick, disabled, style = {} }) => (
 // concurrent requests will occasionally get rate-limited or hit a transient
 // error, and that shouldn't fail the whole count.
 async function analysePhotosViaBackend({ storagePaths, areaId, countId, stageId, stageName }, attempt = 1) {
-  const res = await fetch("/api/analyze-photos", {
+  const res = await apiFetch("/api/analyze-photos", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ areaId, countId, stageId, stageName, storagePaths }),
@@ -284,21 +299,6 @@ function adaptResumedResults(rows, areaItems) {
 }
 
 // ─── Storage-uploaded photo capture ──────────────────────────────────────────
-// Lazily-created browser Supabase client, used ONLY for uploading directly to
-// a signed Storage URL. It's initialized with the public anon key (safe to
-// expose -- same trust level as any public API key), never the service role
-// key, which stays server-side. Requires VITE_SUPABASE_URL and
-// VITE_SUPABASE_ANON_KEY to be set in the Vercel project's env vars.
-let _sb = null;
-function getSupabaseBrowserClient() {
-  if (_sb) return _sb;
-  const url = import.meta.env.VITE_SUPABASE_URL;
-  const key = import.meta.env.VITE_SUPABASE_ANON_KEY;
-  if (!url || !key) throw new Error("Photo upload isn't configured yet (missing VITE_SUPABASE_URL / VITE_SUPABASE_ANON_KEY).");
-  _sb = createClient(url, key);
-  return _sb;
-}
-
 async function sha256Hex(blob) {
   const buf = await blob.arrayBuffer();
   const digest = await crypto.subtle.digest("SHA-256", buf);
@@ -310,14 +310,14 @@ async function sha256Hex(blob) {
 // four separate endpoint files -- Vercel's Hobby plan caps a deployment at 12 Serverless
 // Functions, and four new files would have pushed this project over that limit outright.
 async function startCountSession(areaId, { force = false } = {}) {
-  const res = await fetch("/api/count-session", {
+  const res = await apiFetch("/api/count-session", {
     method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ action: "start", areaId, deviceId: getDeviceId(), force }),
+    body: JSON.stringify({ action: "start", areaId, force }),
   });
   const body = await res.json().catch(() => ({}));
   if (!res.ok) {
     if (res.status === 409 && body.collision) {
-      const err = new Error(body.error || "Another device is already counting this area");
+      const err = new Error(body.error || "Someone else is already counting this area");
       err.collision = { startedAt: body.startedAt, countId: body.countId };
       throw err;
     }
@@ -327,7 +327,7 @@ async function startCountSession(areaId, { force = false } = {}) {
 }
 
 async function resumeCount(areaId) {
-  const res = await fetch(`/api/count-session?areaId=${encodeURIComponent(areaId)}&deviceId=${encodeURIComponent(getDeviceId())}`);
+  const res = await apiFetch(`/api/count-session?areaId=${encodeURIComponent(areaId)}`);
   if (!res.ok) return { resumable: false };
   return res.json(); // { resumable, countId, stageIds, completedStageResults, photos } | { resumable: false, activeElsewhere, startedAt }
 }
@@ -337,7 +337,7 @@ async function resumeCount(areaId) {
 // countId (and would even get "resumed" back into it on next load). This marks the session
 // abandoned server-side rather than deleting it, so it's still there for audit purposes.
 async function abandonCount(countId) {
-  const res = await fetch("/api/count-session", {
+  const res = await apiFetch("/api/count-session", {
     method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ action: "abandon", countId }),
   });
@@ -350,7 +350,7 @@ async function abandonCount(countId) {
 // count_photos for the audit trail. Returns the storage path to hand to
 // analyze-photos once the whole stage's photos are up.
 async function uploadPhotoToStorage({ areaId, stageId, countId, blob, mediaType }) {
-  const urlRes = await fetch("/api/count-session", {
+  const urlRes = await apiFetch("/api/count-session", {
     method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ action: "upload-url", areaId, stageId, mediaType }),
   });
@@ -364,7 +364,7 @@ async function uploadPhotoToStorage({ areaId, stageId, countId, blob, mediaType 
   ]);
   if (uploadErr) throw new Error(uploadErr.message || "Photo upload failed");
 
-  const recordRes = await fetch("/api/count-session", {
+  const recordRes = await apiFetch("/api/count-session", {
     method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ action: "record-photos", countId, photos: [{ storagePath: path, sha256, stageId }] }),
   });
@@ -401,7 +401,7 @@ async function parseInvoice(file) {
   if (isImage || isPdf) body = { mediaType: file.type, data: base64 };
   else body = { csvText: await file.text() };
 
-  const res = await fetch("/api/parse-invoice", {
+  const res = await apiFetch("/api/parse-invoice", {
     method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
   });
   if (!res.ok) {
@@ -420,7 +420,7 @@ async function parseInvoice(file) {
 // into the shapes the rest of this app already expects, so no other
 // component needs to change.
 async function loadCatalog() {
-  const res = await fetch("/api/catalog");
+  const res = await apiFetch("/api/catalog");
   if (!res.ok) throw new Error(`Failed to load catalog (${res.status})`);
   const { locations: rawLocations, areas: rawAreas, items: rawItems, assignments: rawAssignments, stages: rawStages } = await res.json();
 
@@ -454,34 +454,33 @@ async function loadCatalog() {
   return { locations, items, assignments, stages };
 }
 
-// ─── Backend proxy: persist named stages for an area (persists across sessions) ─
-async function saveStagesToBackend(areaId, stagesToSave) {
-  const res = await fetch("/api/upsert-stages", {
+// ─── Backend proxy: catalog writes (items/assignments/stages) ───────────────
+// All of these hit /api/catalog-write (one file, routed by `action`) -- consolidated from
+// 3 separate files for the same Vercel-Hobby-12-function-cap reason as count-session.js.
+async function catalogWrite(action, body) {
+  const res = await apiFetch("/api/catalog-write", {
     method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ areaId, stages: stagesToSave.map(s => ({ id: s.id, name: s.name, sortOrder: s.sortOrder })) }),
+    body: JSON.stringify({ action, ...body }),
   });
   if (!res.ok) {
-    const body = await res.json().catch(() => ({}));
-    throw new Error(body.error || `Saving stages failed (${res.status})`);
-  }
-  return res.json(); // { stages: [{id, area_id, name, sort_order}] }
-}
-
-async function removeStageFromBackend(stageId) {
-  const res = await fetch("/api/upsert-stages", {
-    method: "DELETE", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ id: stageId }),
-  });
-  if (!res.ok) {
-    const body = await res.json().catch(() => ({}));
-    throw new Error(body.error || `Removing stage failed (${res.status})`);
+    const b = await res.json().catch(() => ({}));
+    throw new Error(b.error || `Request failed (${res.status})`);
   }
   return res.json();
 }
 
+async function saveStagesToBackend(areaId, stagesToSave) {
+  return catalogWrite("upsert-stages", { areaId, stages: stagesToSave.map(s => ({ id: s.id, name: s.name, sortOrder: s.sortOrder })) });
+  // -> { stages: [{id, area_id, name, sort_order}] }
+}
+
+async function removeStageFromBackend(stageId) {
+  return catalogWrite("delete-stage", { id: stageId });
+}
+
 // ─── Backend proxy: reference photos for hard-to-identify items ─────────────
 async function saveReferenceImage(itemId, mediaType, data) {
-  const res = await fetch("/api/upload-reference-image", {
+  const res = await apiFetch("/api/upload-reference-image", {
     method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ itemId, mediaType, data }),
   });
@@ -493,7 +492,7 @@ async function saveReferenceImage(itemId, mediaType, data) {
 }
 
 async function fetchFlaggedItems() {
-  const res = await fetch("/api/flagged-items");
+  const res = await apiFetch("/api/flagged-items");
   if (!res.ok) throw new Error(`Failed to load flagged items (${res.status})`);
   const { items } = await res.json();
   return items;
@@ -503,40 +502,16 @@ async function fetchFlaggedItems() {
 // Invoice import, manual add/edit, and "+Add to Catalog" all funnel through
 // here so the item master actually grows in Supabase, not just in memory.
 async function saveItemsToBackend(itemsToSave) {
-  const res = await fetch("/api/upsert-items", {
-    method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ items: itemsToSave }),
-  });
-  if (!res.ok) {
-    const body = await res.json().catch(() => ({}));
-    throw new Error(body.error || `Saving items failed (${res.status})`);
-  }
-  return res.json(); // { items: [{id, name}] }
+  return catalogWrite("upsert-items", { items: itemsToSave }); // -> { items: [{id, name}] }
 }
 
 // ─── Backend proxy: persist area assignment changes (add/update par, remove) ─
 async function saveAssignmentToBackend(itemId, areaId, parLevel) {
-  const res = await fetch("/api/upsert-assignments", {
-    method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ assignments: [{ itemId, areaId, parLevel }] }),
-  });
-  if (!res.ok) {
-    const body = await res.json().catch(() => ({}));
-    throw new Error(body.error || `Saving assignment failed (${res.status})`);
-  }
-  return res.json();
+  return catalogWrite("upsert-assignments", { assignments: [{ itemId, areaId, parLevel }] });
 }
 
 async function removeAssignmentFromBackend(itemId, areaId) {
-  const res = await fetch("/api/upsert-assignments", {
-    method: "DELETE", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ itemId, areaId }),
-  });
-  if (!res.ok) {
-    const body = await res.json().catch(() => ({}));
-    throw new Error(body.error || `Removing assignment failed (${res.status})`);
-  }
-  return res.json();
+  return catalogWrite("delete-assignment", { itemId, areaId });
 }
 
 // ─── Backend proxy: finalize a count session (this locks in overrides + not_found) ─
@@ -547,7 +522,7 @@ async function removeAssignmentFromBackend(itemId, areaId) {
 // (one row, gets an UPDATE) apart from a cross-stage merge or not_found item
 // (zero or multiple rows, gets a new reconciled row) -- see finalize-count.js.
 async function finalizeCountToBackend(countId, areaId, requireApproval, items) {
-  const res = await fetch("/api/finalize-count", {
+  const res = await apiFetch("/api/finalize-count", {
     method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       countId, areaId, requireApproval,
@@ -568,11 +543,41 @@ async function finalizeCountToBackend(countId, areaId, requireApproval, items) {
 
 // ─── Backend proxy: last finalized count for an area (starting reference) ────
 async function fetchLastCount(areaId) {
-  const res = await fetch(`/api/last-count?areaId=${encodeURIComponent(areaId)}`);
+  const res = await apiFetch(`/api/last-count?areaId=${encodeURIComponent(areaId)}`);
   if (!res.ok) return null;
   const { lastCount } = await res.json();
   return lastCount;
 }
+
+// ─── Backend proxy: org/team management (identity, members, invites, join codes) ────
+async function fetchWhoAmI() {
+  const res = await apiFetch("/api/org?action=me");
+  if (!res.ok) throw new Error(`Failed to load account info (${res.status})`);
+  return res.json(); // { userId, email, orgId, orgName, role }
+}
+
+async function fetchOrgMembers() {
+  const res = await apiFetch("/api/org?action=members");
+  if (!res.ok) { const b = await res.json().catch(() => ({})); throw new Error(b.error || "Failed to load team"); }
+  const { members } = await res.json();
+  return members; // [{ userId, email, role, joinedAt }]
+}
+
+async function orgAction(action, body) {
+  const res = await apiFetch("/api/org", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ action, ...body }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || `Request failed (${res.status})`);
+  return data;
+}
+
+async function inviteMemberByEmail(email, role) { return orgAction("invite-email", { email, role }); }
+async function createJoinCode(role, expiresInHours) { return orgAction("create-join-code", { role, expiresInHours }); } // -> { code, role, expiresAt }
+async function redeemJoinCode(code) { return orgAction("redeem-join-code", { code }); } // -> { joined, orgId, role }
+async function updateMemberRole(userId, role) { return orgAction("update-role", { userId, role }); }
+async function removeMember(userId) { return orgAction("remove-member", { userId }); }
 
 // ─── SCREEN: Dashboard ────────────────────────────────────────────────────────
 const Dashboard = ({ locations, items, assignments, navigate }) => {
@@ -652,7 +657,8 @@ const Dashboard = ({ locations, items, assignments, navigate }) => {
 };
 
 // ─── SCREEN: Sites & Areas (fully user-customized) ───────────────────────────
-const SitesScreen = ({ locations, setLocations, settings }) => {
+const SitesScreen = ({ locations, setLocations, settings, role }) => {
+  const isManager = role === "manager";
   const [modal, setModal] = useState(null); // null | "add" | loc
   const [confirm, setConfirm] = useState(null);
   const [form, setForm] = useState({ name: "", type: "Restaurant", areas: [] });
@@ -683,8 +689,8 @@ const SitesScreen = ({ locations, setLocations, settings }) => {
           <h1 style={{ fontSize: 24, fontWeight: 400, color: C.navy, margin: 0, fontFamily: "'DM Serif Display', serif" }}>Sites & Areas</h1>
           <p style={{ fontSize: 13, color: C.textSub, margin: "4px 0 0" }}>Define your own locations and storage areas</p>
         </div>
-        <button onClick={openAdd} style={{ background: C.navy, border: "none", color: "#fff", borderRadius: 12, padding: "10px 16px", fontWeight: 800, fontSize: 13, cursor: "pointer", display: "flex", alignItems: "center", gap: 6 }}>
-          <Icon name="plus" size={16} color={C.gold} />Add Site
+        <button onClick={openAdd} disabled={!isManager} style={{ background: isManager ? C.navy : C.border, border: "none", color: isManager ? "#fff" : C.textMuted, borderRadius: 12, padding: "10px 16px", fontWeight: 800, fontSize: 13, cursor: isManager ? "pointer" : "not-allowed", display: "flex", alignItems: "center", gap: 6 }}>
+          <Icon name="plus" size={16} color={isManager ? C.gold : C.textMuted} />Add Site
         </button>
       </div>
 
@@ -707,10 +713,12 @@ const SitesScreen = ({ locations, setLocations, settings }) => {
                 {loc.areas.length === 0 && <span style={{ fontSize: 11, color: C.textMuted }}>No areas defined</span>}
               </div>
             </div>
-            <div style={{ borderTop: `1px solid ${C.border}`, padding: "10px 16px", display: "flex", justifyContent: "flex-end", gap: 8 }}>
-              <button onClick={() => openEdit(loc)} style={{ background: C.cardAlt, border: `1px solid ${C.border}`, color: C.textSub, borderRadius: 8, padding: "7px 12px", fontSize: 12, fontWeight: 700, cursor: "pointer", display: "flex", alignItems: "center", gap: 5 }}><Icon name="edit" size={13} color={C.textSub} />Edit</button>
-              <button onClick={() => setConfirm(loc.id)} style={{ background: C.redBg, border: `1px solid ${C.redBorder}`, color: C.red, borderRadius: 8, padding: "7px 12px", fontSize: 12, fontWeight: 700, cursor: "pointer", display: "flex", alignItems: "center", gap: 5 }}><Icon name="trash" size={13} color={C.red} />Delete</button>
-            </div>
+            {isManager && (
+              <div style={{ borderTop: `1px solid ${C.border}`, padding: "10px 16px", display: "flex", justifyContent: "flex-end", gap: 8 }}>
+                <button onClick={() => openEdit(loc)} style={{ background: C.cardAlt, border: `1px solid ${C.border}`, color: C.textSub, borderRadius: 8, padding: "7px 12px", fontSize: 12, fontWeight: 700, cursor: "pointer", display: "flex", alignItems: "center", gap: 5 }}><Icon name="edit" size={13} color={C.textSub} />Edit</button>
+                <button onClick={() => setConfirm(loc.id)} style={{ background: C.redBg, border: `1px solid ${C.redBorder}`, color: C.red, borderRadius: 8, padding: "7px 12px", fontSize: 12, fontWeight: 700, cursor: "pointer", display: "flex", alignItems: "center", gap: 5 }}><Icon name="trash" size={13} color={C.red} />Delete</button>
+              </div>
+            )}
           </div>
         ))}
       </div>
@@ -761,7 +769,8 @@ const SitesScreen = ({ locations, setLocations, settings }) => {
 };
 
 // ─── SCREEN: Catalog (global master + per-area assignments) ──────────────────
-const CatalogScreen = ({ items, setItems, assignments, setAssignments, locations, settings, setSettings }) => {
+const CatalogScreen = ({ items, setItems, assignments, setAssignments, locations, settings, setSettings, role }) => {
+  const isManager = role === "manager";
   const [tab, setTab] = useState("master"); // master | assignments
   const [modal, setModal] = useState(null);
   const [assignModal, setAssignModal] = useState(null); // item being assigned
@@ -913,14 +922,20 @@ const CatalogScreen = ({ items, setItems, assignments, setAssignments, locations
 
       {tab === "master" && (
         <>
-          <div style={{ display: "flex", gap: 8, marginBottom: 14 }}>
-            <button onClick={() => setShowInvoice(true)} style={{ flex: 2, background: C.goldDim, border: `1px solid ${C.goldBorder}`, color: C.navy, borderRadius: 10, padding: "12px", fontWeight: 800, fontSize: 13, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", gap: 7 }}>
-              <Icon name="upload" size={16} color={C.gold} />Import Vendor Invoice
-            </button>
-            <button onClick={() => { setForm(blank); setModal("add"); }} style={{ flex: 1, background: C.navy, border: "none", color: "#fff", borderRadius: 10, padding: "12px", fontWeight: 800, fontSize: 13, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }}>
-              <Icon name="plus" size={15} color={C.gold} />Add
-            </button>
-          </div>
+          {isManager ? (
+            <div style={{ display: "flex", gap: 8, marginBottom: 14 }}>
+              <button onClick={() => setShowInvoice(true)} style={{ flex: 2, background: C.goldDim, border: `1px solid ${C.goldBorder}`, color: C.navy, borderRadius: 10, padding: "12px", fontWeight: 800, fontSize: 13, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", gap: 7 }}>
+                <Icon name="upload" size={16} color={C.gold} />Import Vendor Invoice
+              </button>
+              <button onClick={() => { setForm(blank); setModal("add"); }} style={{ flex: 1, background: C.navy, border: "none", color: "#fff", borderRadius: 10, padding: "12px", fontWeight: 800, fontSize: 13, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }}>
+                <Icon name="plus" size={15} color={C.gold} />Add
+              </button>
+            </div>
+          ) : (
+            <div style={{ padding: "10px 14px", background: C.cardAlt, border: `1px solid ${C.border}`, borderRadius: 10, marginBottom: 14 }}>
+              <p style={{ margin: 0, fontSize: 12, color: C.textSub }}>View-only — ask a manager to add or edit catalog items.</p>
+            </div>
+          )}
 
           <input value={search} onChange={e => setSearch(e.target.value)} placeholder="Search name, SKU, alias…"
             style={{ width: "100%", background: C.card, border: `1px solid ${C.borderDark}`, borderRadius: 10, padding: "11px 14px", color: C.text, fontSize: 13, outline: "none", fontFamily: "'DM Sans', sans-serif", marginBottom: 14 }} />
@@ -945,11 +960,13 @@ const CatalogScreen = ({ items, setItems, assignments, setAssignments, locations
                       </div>
                     </div>
                   </div>
-                  <div style={{ borderTop: `1px solid ${C.border}`, padding: "8px 14px", display: "flex", gap: 8 }}>
-                    <button onClick={() => { setAssignModal(item); setAssignForm({ locationId: locations[0]?.id || "", areaId: "", par: "" }); }} style={{ flex: 1, background: C.goldDim, border: `1px solid ${C.goldBorder}`, color: C.navy, borderRadius: 8, padding: 8, fontSize: 12, fontWeight: 700, cursor: "pointer" }}>Assign to Areas ({asg.length})</button>
-                    <button onClick={() => { setForm({ ...item }); setModal(item); }} style={{ background: C.cardAlt, border: `1px solid ${C.border}`, color: C.textSub, borderRadius: 8, padding: "8px 12px", fontSize: 12, fontWeight: 700, cursor: "pointer" }}><Icon name="edit" size={13} color={C.textSub} /></button>
-                    <button onClick={() => setConfirm(item.id)} style={{ background: C.redBg, border: `1px solid ${C.redBorder}`, color: C.red, borderRadius: 8, padding: "8px 12px", fontSize: 12, fontWeight: 700, cursor: "pointer" }}><Icon name="trash" size={13} color={C.red} /></button>
-                  </div>
+                  {isManager && (
+                    <div style={{ borderTop: `1px solid ${C.border}`, padding: "8px 14px", display: "flex", gap: 8 }}>
+                      <button onClick={() => { setAssignModal(item); setAssignForm({ locationId: locations[0]?.id || "", areaId: "", par: "" }); }} style={{ flex: 1, background: C.goldDim, border: `1px solid ${C.goldBorder}`, color: C.navy, borderRadius: 8, padding: 8, fontSize: 12, fontWeight: 700, cursor: "pointer" }}>Assign to Areas ({asg.length})</button>
+                      <button onClick={() => { setForm({ ...item }); setModal(item); }} style={{ background: C.cardAlt, border: `1px solid ${C.border}`, color: C.textSub, borderRadius: 8, padding: "8px 12px", fontSize: 12, fontWeight: 700, cursor: "pointer" }}><Icon name="edit" size={13} color={C.textSub} /></button>
+                      <button onClick={() => setConfirm(item.id)} style={{ background: C.redBg, border: `1px solid ${C.redBorder}`, color: C.red, borderRadius: 8, padding: "8px 12px", fontSize: 12, fontWeight: 700, cursor: "pointer" }}><Icon name="trash" size={13} color={C.red} /></button>
+                    </div>
+                  )}
                 </div>
               );
             })}
@@ -977,7 +994,7 @@ const CatalogScreen = ({ items, setItems, assignments, setAssignments, locations
                           <p style={{ margin: 0, fontSize: 12, fontWeight: 600, color: C.text }}>{item.name}</p>
                           <p style={{ margin: 0, fontSize: 10, color: C.textMuted }}>{item.sku} · par {a.par} {item.unit}</p>
                         </div>
-                        <button onClick={() => removeAssignment(a.id, a.itemId, a.areaId)} style={{ background: "none", border: "none", cursor: "pointer", padding: 4 }}><Icon name="close" size={14} color={C.textMuted} /></button>
+                        <button onClick={() => removeAssignment(a.id, a.itemId, a.areaId)} style={{ background: "none", border: "none", cursor: isManager ? "pointer" : "not-allowed", padding: 4, opacity: isManager ? 1 : 0.3 }} disabled={!isManager}><Icon name="close" size={14} color={C.textMuted} /></button>
                       </div>
                     ))}
                   </div>
@@ -1022,13 +1039,15 @@ const CatalogScreen = ({ items, setItems, assignments, setAssignments, locations
                     <p style={{ margin: 0, fontSize: 13, fontWeight: 700, color: C.navy }}>{f.name}</p>
                     <p style={{ margin: "2px 0 0", fontSize: 11, color: C.textMuted }}>{f.brand || "No brand"} · flagged {f.occurrences}× in recent counts</p>
                   </div>
-                  <button
-                    onClick={() => { refFileRef.current.dataset.forItem = f.itemId; refFileRef.current.click(); }}
-                    disabled={uploadingFor === f.itemId}
-                    style={{ background: C.goldDim, border: `1px solid ${C.goldBorder}`, color: C.navy, borderRadius: 8, padding: "8px 12px", fontSize: 12, fontWeight: 700, cursor: "pointer", display: "flex", alignItems: "center", gap: 6, flexShrink: 0 }}>
-                    <Icon name="camera" size={14} color={C.gold} />
-                    {uploadingFor === f.itemId ? "Uploading…" : "Add Photo"}
-                  </button>
+                  {isManager && (
+                    <button
+                      onClick={() => { refFileRef.current.dataset.forItem = f.itemId; refFileRef.current.click(); }}
+                      disabled={uploadingFor === f.itemId}
+                      style={{ background: C.goldDim, border: `1px solid ${C.goldBorder}`, color: C.navy, borderRadius: 8, padding: "8px 12px", fontSize: 12, fontWeight: 700, cursor: "pointer", display: "flex", alignItems: "center", gap: 6, flexShrink: 0 }}>
+                      <Icon name="camera" size={14} color={C.gold} />
+                      {uploadingFor === f.itemId ? "Uploading…" : "Add Photo"}
+                    </button>
+                  )}
                 </div>
               ))}
             </div>
@@ -1864,7 +1883,8 @@ const ReviewScreen = ({ navigate, countItems, setCountItems, countMeta, settings
 // order quantities inflated by stock already sitting in areas that weren't part of this count.
 // A true multi-area "full location" mode needs countItems to accumulate across every area
 // counted in a session before this can safely roll up total par vs. total on-hand.
-const OrdersScreen = ({ countItems, items, assignments }) => {
+const OrdersScreen = ({ countItems, items, assignments, role }) => {
+  const isManager = role === "manager";
   const counted = (countItems || []).filter(i => i.sku && i.matchStatus !== "unknown");
   const rows = [];
   const bySku = new Map();
@@ -1918,20 +1938,143 @@ const OrdersScreen = ({ countItems, items, assignments }) => {
               </div>
             ))}
           </div>
-          <div style={{ display: "flex", gap: 10 }}>
-            <button style={{ flex: 1, background: C.card, border: `1px solid ${C.borderDark}`, color: C.textSub, borderRadius: 12, padding: 14, fontWeight: 700, fontSize: 13, cursor: "pointer" }}>Export PDF</button>
-            <GoldBtn style={{ flex: 2, padding: 14 }}>Submit to Vendors</GoldBtn>
-          </div>
+          {isManager ? (
+            <div style={{ display: "flex", gap: 10 }}>
+              <button style={{ flex: 1, background: C.card, border: `1px solid ${C.borderDark}`, color: C.textSub, borderRadius: 12, padding: 14, fontWeight: 700, fontSize: 13, cursor: "pointer" }}>Export PDF</button>
+              <GoldBtn style={{ flex: 2, padding: 14 }}>Submit to Vendors</GoldBtn>
+            </div>
+          ) : (
+            <div style={{ padding: "10px 14px", background: C.cardAlt, border: `1px solid ${C.border}`, borderRadius: 10, textAlign: "center" }}>
+              <p style={{ margin: 0, fontSize: 12, color: C.textSub }}>View-only — ask a manager to export or submit this order.</p>
+            </div>
+          )}
         </>
       )}
     </div>
   );
 };
 
+// ─── SCREEN: Team (manager-only member management) ───────────────────────────
+const TeamSection = () => {
+  const [members, setMembers] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+  const [inviteEmail, setInviteEmail] = useState("");
+  const [inviteRole, setInviteRole] = useState("counter");
+  const [inviting, setInviting] = useState(false);
+  const [inviteMsg, setInviteMsg] = useState("");
+  const [codeRole, setCodeRole] = useState("counter");
+  const [makingCode, setMakingCode] = useState(false);
+  const [generatedCode, setGeneratedCode] = useState(null); // { code, role, expiresAt }
+  const [busyUserId, setBusyUserId] = useState(null);
+
+  const load = () => {
+    setLoading(true); setError("");
+    fetchOrgMembers().then(setMembers).catch(e => setError(e.message || "Could not load team")).finally(() => setLoading(false));
+  };
+  useEffect(() => { load(); }, []);
+
+  const doInvite = async () => {
+    if (!inviteEmail.trim()) return;
+    setInviting(true); setInviteMsg("");
+    try {
+      await inviteMemberByEmail(inviteEmail.trim(), inviteRole);
+      setInviteMsg(`Invite sent to ${inviteEmail.trim()}`);
+      setInviteEmail("");
+      load();
+    } catch (e) { setInviteMsg(e.message || "Could not send invite"); }
+    finally { setInviting(false); }
+  };
+
+  const doCreateCode = async () => {
+    setMakingCode(true); setGeneratedCode(null);
+    try { setGeneratedCode(await createJoinCode(codeRole, 24 * 7)); }
+    catch (e) { setInviteMsg(e.message || "Could not create join code"); }
+    finally { setMakingCode(false); }
+  };
+
+  const doUpdateRole = async (userId, role) => {
+    setBusyUserId(userId);
+    try { await updateMemberRole(userId, role); load(); }
+    catch (e) { setError(e.message || "Could not update role"); }
+    finally { setBusyUserId(null); }
+  };
+
+  const doRemove = async (userId) => {
+    setBusyUserId(userId);
+    try { await removeMember(userId); load(); }
+    catch (e) { setError(e.message || "Could not remove member"); }
+    finally { setBusyUserId(null); }
+  };
+
+  return (
+    <div style={{ marginBottom: 20 }}>
+      <p style={{ fontSize: 11, fontWeight: 700, color: C.textMuted, textTransform: "uppercase", letterSpacing: "0.1em", margin: "0 0 10px" }}>Team</p>
+
+      <div style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 12, padding: 14, marginBottom: 12 }}>
+        <p style={{ margin: "0 0 10px", fontSize: 13, fontWeight: 700, color: C.text }}>Invite by email</p>
+        <div style={{ display: "flex", gap: 8, marginBottom: 8 }}>
+          <input value={inviteEmail} onChange={e => setInviteEmail(e.target.value)} placeholder="name@company.com" style={{ flex: 1, background: C.cardAlt, border: `1px solid ${C.borderDark}`, borderRadius: 8, padding: "9px 12px", fontSize: 13, outline: "none", fontFamily: "'DM Sans', sans-serif" }} />
+          <select value={inviteRole} onChange={e => setInviteRole(e.target.value)} style={{ background: C.cardAlt, border: `1px solid ${C.borderDark}`, borderRadius: 8, padding: "9px 10px", fontSize: 12, fontWeight: 700 }}>
+            <option value="counter">Counter</option>
+            <option value="manager">Manager</option>
+          </select>
+        </div>
+        <PrimaryBtn onClick={doInvite} disabled={inviting || !inviteEmail.trim()} style={{ padding: 10, fontSize: 13 }}>{inviting ? "Sending…" : "Send Invite"}</PrimaryBtn>
+        {inviteMsg && <p style={{ margin: "8px 0 0", fontSize: 12, color: C.textSub }}>{inviteMsg}</p>}
+      </div>
+
+      <div style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 12, padding: 14, marginBottom: 12 }}>
+        <p style={{ margin: "0 0 10px", fontSize: 13, fontWeight: 700, color: C.text }}>Or share a join code</p>
+        <div style={{ display: "flex", gap: 8, marginBottom: 10 }}>
+          <select value={codeRole} onChange={e => setCodeRole(e.target.value)} style={{ flex: 1, background: C.cardAlt, border: `1px solid ${C.borderDark}`, borderRadius: 8, padding: "9px 10px", fontSize: 12, fontWeight: 700 }}>
+            <option value="counter">Counter</option>
+            <option value="manager">Manager</option>
+          </select>
+          <button onClick={doCreateCode} disabled={makingCode} style={{ background: C.goldDim, border: `1px solid ${C.goldBorder}`, color: C.navy, borderRadius: 8, padding: "9px 14px", fontWeight: 700, fontSize: 12, cursor: "pointer" }}>{makingCode ? "…" : "Generate Code"}</button>
+        </div>
+        {generatedCode && (
+          <div style={{ background: C.cardAlt, border: `1px solid ${C.border}`, borderRadius: 8, padding: 10, textAlign: "center" }}>
+            <p style={{ margin: 0, fontSize: 20, fontWeight: 800, color: C.navy, letterSpacing: "0.1em" }}>{generatedCode.code}</p>
+            <p style={{ margin: "4px 0 0", fontSize: 11, color: C.textMuted }}>{generatedCode.role} · expires {new Date(generatedCode.expiresAt).toLocaleDateString()}</p>
+          </div>
+        )}
+      </div>
+
+      <div style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 12, padding: 14 }}>
+        <p style={{ margin: "0 0 10px", fontSize: 13, fontWeight: 700, color: C.text }}>Members</p>
+        {error && <p style={{ margin: "0 0 8px", fontSize: 12, color: C.red }}>{error}</p>}
+        {loading ? (
+          <p style={{ fontSize: 12, color: C.textMuted }}>Loading…</p>
+        ) : (
+          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+            {(members || []).map(m => (
+              <div key={m.userId} style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, padding: "7px 0", borderTop: `1px solid ${C.border}` }}>
+                <div style={{ minWidth: 0 }}>
+                  <p style={{ margin: 0, fontSize: 12, fontWeight: 600, color: C.text, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{m.email}</p>
+                </div>
+                <div style={{ display: "flex", gap: 6, flexShrink: 0, alignItems: "center" }}>
+                  <select value={m.role} disabled={busyUserId === m.userId} onChange={e => doUpdateRole(m.userId, e.target.value)}
+                    style={{ background: C.cardAlt, border: `1px solid ${C.borderDark}`, borderRadius: 6, padding: "5px 6px", fontSize: 11, fontWeight: 700 }}>
+                    <option value="counter">Counter</option>
+                    <option value="manager">Manager</option>
+                  </select>
+                  <button onClick={() => doRemove(m.userId)} disabled={busyUserId === m.userId} style={{ background: "none", border: "none", cursor: "pointer", padding: 4 }}><Icon name="trash" size={13} color={C.red} /></button>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+};
+
 // ─── SCREEN: Settings ─────────────────────────────────────────────────────────
-const SettingsScreen = ({ settings, setSettings }) => {
+const SettingsScreen = ({ settings, setSettings, auth, onSignOut }) => {
   const [newUnit, setNewUnit] = useState("");
   const [newVendor, setNewVendor] = useState("");
+  const isManager = auth?.role === "manager";
   const set = (k, v) => setSettings(s => ({ ...s, [k]: v }));
 
   return (
@@ -1939,61 +2082,81 @@ const SettingsScreen = ({ settings, setSettings }) => {
       <h1 style={{ fontSize: 24, fontWeight: 400, color: C.navy, margin: 0, fontFamily: "'DM Serif Display', serif" }}>Settings</h1>
       <p style={{ fontSize: 13, color: C.textSub, margin: "4px 0 20px" }}>Customize InventoryIQ to how your operation runs</p>
 
-      <p style={{ fontSize: 11, fontWeight: 700, color: C.textMuted, textTransform: "uppercase", letterSpacing: "0.1em", margin: "0 0 10px" }}>Industry</p>
-      <div style={{ display: "flex", background: C.cardAlt, border: `1px solid ${C.border}`, borderRadius: 12, padding: 4, marginBottom: 20 }}>
-        {["Foodservice","Retail"].map(ind => (
-          <button key={ind} onClick={() => set("industry", ind)} style={{ flex: 1, background: settings.industry === ind ? C.navy : "transparent", border: "none", color: settings.industry === ind ? "#fff" : C.textSub, borderRadius: 9, padding: 10, fontWeight: 700, fontSize: 13, cursor: "pointer" }}>{ind}</button>
-        ))}
+      <div style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 12, padding: 14, marginBottom: 20, display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10 }}>
+        <div style={{ minWidth: 0 }}>
+          <p style={{ margin: 0, fontSize: 13, fontWeight: 700, color: C.text, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{auth?.email}</p>
+          <p style={{ margin: "2px 0 0", fontSize: 11, color: C.textMuted }}>{auth?.orgName} · {isManager ? "Manager" : "Counter"}</p>
+        </div>
+        <button onClick={onSignOut} style={{ background: C.redBg, border: `1px solid ${C.redBorder}`, color: C.red, borderRadius: 8, padding: "8px 14px", fontSize: 12, fontWeight: 700, cursor: "pointer", flexShrink: 0 }}>Sign Out</button>
       </div>
 
-      <p style={{ fontSize: 11, fontWeight: 700, color: C.textMuted, textTransform: "uppercase", letterSpacing: "0.1em", margin: "0 0 10px" }}>Workflow Rules</p>
-      <div style={{ display: "flex", flexDirection: "column", gap: 10, marginBottom: 20 }}>
-        <Toggle label="Staff can add items during counts" sub="When Claude finds an unknown item, counting staff can add it to the catalog on the spot. Off = managers only." value={settings.staffCanAddItems} onChange={v => set("staffCanAddItems", v)} />
-        <Toggle label="Require approval before finalizing" sub="Counts must be submitted to a manager for sign-off before they lock and feed ordering." value={settings.requireApproval} onChange={v => set("requireApproval", v)} />
-        <div style={{ padding: "14px 16px", background: C.card, border: `1px solid ${C.border}`, borderRadius: 12 }}>
-          <p style={{ margin: "0 0 4px", fontSize: 13, fontWeight: 700, color: C.text }}>Inventory attribution</p>
-          <p style={{ margin: "0 0 10px", fontSize: 11, color: C.textSub, lineHeight: 1.5 }}>How counts are attributed when items are stored across areas</p>
-          <div style={{ display: "flex", background: C.cardAlt, borderRadius: 10, padding: 3 }}>
-            {[["physical","Where it sits"],["department","Department owns"]].map(([k, label]) => (
-              <button key={k} onClick={() => set("attributionRule", k)} style={{ flex: 1, background: settings.attributionRule === k ? C.gold : "transparent", border: "none", color: settings.attributionRule === k ? C.navy : C.textSub, borderRadius: 8, padding: 8, fontWeight: 700, fontSize: 12, cursor: "pointer" }}>{label}</button>
+      {!isManager && (
+        <div style={{ padding: "10px 14px", background: C.cardAlt, border: `1px solid ${C.border}`, borderRadius: 10, marginBottom: 20 }}>
+          <p style={{ margin: 0, fontSize: 12, color: C.textSub }}>Workflow settings and team management are manager-only.</p>
+        </div>
+      )}
+
+      {isManager && <TeamSection />}
+
+      {isManager && (
+        <>
+          <p style={{ fontSize: 11, fontWeight: 700, color: C.textMuted, textTransform: "uppercase", letterSpacing: "0.1em", margin: "0 0 10px" }}>Industry</p>
+          <div style={{ display: "flex", background: C.cardAlt, border: `1px solid ${C.border}`, borderRadius: 12, padding: 4, marginBottom: 20 }}>
+            {["Foodservice","Retail"].map(ind => (
+              <button key={ind} onClick={() => set("industry", ind)} style={{ flex: 1, background: settings.industry === ind ? C.navy : "transparent", border: "none", color: settings.industry === ind ? "#fff" : C.textSub, borderRadius: 9, padding: 10, fontWeight: 700, fontSize: 13, cursor: "pointer" }}>{ind}</button>
             ))}
           </div>
-        </div>
-        <div style={{ padding: "14px 16px", background: C.card, border: `1px solid ${C.border}`, borderRadius: 12 }}>
-          <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 8 }}>
-            <p style={{ margin: 0, fontSize: 13, fontWeight: 700, color: C.text }}>AI confidence threshold</p>
-            <span style={{ fontSize: 14, fontWeight: 800, color: C.gold }}>{Math.round(settings.confidenceThreshold * 100)}%</span>
+
+          <p style={{ fontSize: 11, fontWeight: 700, color: C.textMuted, textTransform: "uppercase", letterSpacing: "0.1em", margin: "0 0 10px" }}>Workflow Rules</p>
+          <div style={{ display: "flex", flexDirection: "column", gap: 10, marginBottom: 20 }}>
+            <Toggle label="Staff can add items during counts" sub="When Claude finds an unknown item, counting staff can add it to the catalog on the spot. Off = managers only." value={settings.staffCanAddItems} onChange={v => set("staffCanAddItems", v)} />
+            <Toggle label="Require approval before finalizing" sub="Counts must be submitted to a manager for sign-off before they lock and feed ordering." value={settings.requireApproval} onChange={v => set("requireApproval", v)} />
+            <div style={{ padding: "14px 16px", background: C.card, border: `1px solid ${C.border}`, borderRadius: 12 }}>
+              <p style={{ margin: "0 0 4px", fontSize: 13, fontWeight: 700, color: C.text }}>Inventory attribution</p>
+              <p style={{ margin: "0 0 10px", fontSize: 11, color: C.textSub, lineHeight: 1.5 }}>How counts are attributed when items are stored across areas</p>
+              <div style={{ display: "flex", background: C.cardAlt, borderRadius: 10, padding: 3 }}>
+                {[["physical","Where it sits"],["department","Department owns"]].map(([k, label]) => (
+                  <button key={k} onClick={() => set("attributionRule", k)} style={{ flex: 1, background: settings.attributionRule === k ? C.gold : "transparent", border: "none", color: settings.attributionRule === k ? C.navy : C.textSub, borderRadius: 8, padding: 8, fontWeight: 700, fontSize: 12, cursor: "pointer" }}>{label}</button>
+                ))}
+              </div>
+            </div>
+            <div style={{ padding: "14px 16px", background: C.card, border: `1px solid ${C.border}`, borderRadius: 12 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 8 }}>
+                <p style={{ margin: 0, fontSize: 13, fontWeight: 700, color: C.text }}>AI confidence threshold</p>
+                <span style={{ fontSize: 14, fontWeight: 800, color: C.gold }}>{Math.round(settings.confidenceThreshold * 100)}%</span>
+              </div>
+              <p style={{ margin: "0 0 10px", fontSize: 11, color: C.textSub, lineHeight: 1.5 }}>Items below this confidence are flagged for manual verification</p>
+              <input type="range" min="0.5" max="0.95" step="0.05" value={settings.confidenceThreshold} onChange={e => set("confidenceThreshold", parseFloat(e.target.value))} style={{ width: "100%", accentColor: C.gold }} />
+            </div>
           </div>
-          <p style={{ margin: "0 0 10px", fontSize: 11, color: C.textSub, lineHeight: 1.5 }}>Items below this confidence are flagged for manual verification</p>
-          <input type="range" min="0.5" max="0.95" step="0.05" value={settings.confidenceThreshold} onChange={e => set("confidenceThreshold", parseFloat(e.target.value))} style={{ width: "100%", accentColor: C.gold }} />
-        </div>
-      </div>
 
-      <p style={{ fontSize: 11, fontWeight: 700, color: C.textMuted, textTransform: "uppercase", letterSpacing: "0.1em", margin: "0 0 10px" }}>Units of Measure</p>
-      <div style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 12, padding: 14, marginBottom: 20 }}>
-        <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 10 }}>
-          {settings.units.map(u => (
-            <span key={u} onClick={() => set("units", settings.units.filter(x => x !== u))} style={{ fontSize: 12, fontWeight: 600, color: C.navy, background: C.goldDim, border: `1px solid ${C.goldBorder}`, borderRadius: 20, padding: "5px 10px", cursor: "pointer", display: "flex", alignItems: "center", gap: 6 }}>{u} <Icon name="close" size={9} color={C.gold} /></span>
-          ))}
-        </div>
-        <div style={{ display: "flex", gap: 8 }}>
-          <input value={newUnit} onChange={e => setNewUnit(e.target.value)} onKeyDown={e => e.key === "Enter" && newUnit.trim() && (set("units", [...settings.units, newUnit.trim()]), setNewUnit(""))} placeholder="Add unit…" style={{ flex: 1, background: C.cardAlt, border: `1px solid ${C.borderDark}`, borderRadius: 8, padding: "9px 12px", fontSize: 13, outline: "none", fontFamily: "'DM Sans', sans-serif" }} />
-          <button onClick={() => { if (newUnit.trim()) { set("units", [...settings.units, newUnit.trim()]); setNewUnit(""); } }} style={{ background: C.navy, border: "none", color: C.gold, borderRadius: 8, padding: "9px 14px", fontWeight: 700, cursor: "pointer" }}>Add</button>
-        </div>
-      </div>
+          <p style={{ fontSize: 11, fontWeight: 700, color: C.textMuted, textTransform: "uppercase", letterSpacing: "0.1em", margin: "0 0 10px" }}>Units of Measure</p>
+          <div style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 12, padding: 14, marginBottom: 20 }}>
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 10 }}>
+              {settings.units.map(u => (
+                <span key={u} onClick={() => set("units", settings.units.filter(x => x !== u))} style={{ fontSize: 12, fontWeight: 600, color: C.navy, background: C.goldDim, border: `1px solid ${C.goldBorder}`, borderRadius: 20, padding: "5px 10px", cursor: "pointer", display: "flex", alignItems: "center", gap: 6 }}>{u} <Icon name="close" size={9} color={C.gold} /></span>
+              ))}
+            </div>
+            <div style={{ display: "flex", gap: 8 }}>
+              <input value={newUnit} onChange={e => setNewUnit(e.target.value)} onKeyDown={e => e.key === "Enter" && newUnit.trim() && (set("units", [...settings.units, newUnit.trim()]), setNewUnit(""))} placeholder="Add unit…" style={{ flex: 1, background: C.cardAlt, border: `1px solid ${C.borderDark}`, borderRadius: 8, padding: "9px 12px", fontSize: 13, outline: "none", fontFamily: "'DM Sans', sans-serif" }} />
+              <button onClick={() => { if (newUnit.trim()) { set("units", [...settings.units, newUnit.trim()]); setNewUnit(""); } }} style={{ background: C.navy, border: "none", color: C.gold, borderRadius: 8, padding: "9px 14px", fontWeight: 700, cursor: "pointer" }}>Add</button>
+            </div>
+          </div>
 
-      <p style={{ fontSize: 11, fontWeight: 700, color: C.textMuted, textTransform: "uppercase", letterSpacing: "0.1em", margin: "0 0 10px" }}>Vendors</p>
-      <div style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 12, padding: 14 }}>
-        <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 10 }}>
-          {settings.vendors.map(v => (
-            <span key={v} onClick={() => set("vendors", settings.vendors.filter(x => x !== v))} style={{ fontSize: 12, fontWeight: 600, color: C.navy, background: C.goldDim, border: `1px solid ${C.goldBorder}`, borderRadius: 20, padding: "5px 10px", cursor: "pointer", display: "flex", alignItems: "center", gap: 6 }}>{v} <Icon name="close" size={9} color={C.gold} /></span>
-          ))}
-        </div>
-        <div style={{ display: "flex", gap: 8 }}>
-          <input value={newVendor} onChange={e => setNewVendor(e.target.value)} onKeyDown={e => e.key === "Enter" && newVendor.trim() && (set("vendors", [...settings.vendors, newVendor.trim()]), setNewVendor(""))} placeholder="Add vendor…" style={{ flex: 1, background: C.cardAlt, border: `1px solid ${C.borderDark}`, borderRadius: 8, padding: "9px 12px", fontSize: 13, outline: "none", fontFamily: "'DM Sans', sans-serif" }} />
-          <button onClick={() => { if (newVendor.trim()) { set("vendors", [...settings.vendors, newVendor.trim()]); setNewVendor(""); } }} style={{ background: C.navy, border: "none", color: C.gold, borderRadius: 8, padding: "9px 14px", fontWeight: 700, cursor: "pointer" }}>Add</button>
-        </div>
-      </div>
+          <p style={{ fontSize: 11, fontWeight: 700, color: C.textMuted, textTransform: "uppercase", letterSpacing: "0.1em", margin: "0 0 10px" }}>Vendors</p>
+          <div style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 12, padding: 14 }}>
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 10 }}>
+              {settings.vendors.map(v => (
+                <span key={v} onClick={() => set("vendors", settings.vendors.filter(x => x !== v))} style={{ fontSize: 12, fontWeight: 600, color: C.navy, background: C.goldDim, border: `1px solid ${C.goldBorder}`, borderRadius: 20, padding: "5px 10px", cursor: "pointer", display: "flex", alignItems: "center", gap: 6 }}>{v} <Icon name="close" size={9} color={C.gold} /></span>
+              ))}
+            </div>
+            <div style={{ display: "flex", gap: 8 }}>
+              <input value={newVendor} onChange={e => setNewVendor(e.target.value)} onKeyDown={e => e.key === "Enter" && newVendor.trim() && (set("vendors", [...settings.vendors, newVendor.trim()]), setNewVendor(""))} placeholder="Add vendor…" style={{ flex: 1, background: C.cardAlt, border: `1px solid ${C.borderDark}`, borderRadius: 8, padding: "9px 12px", fontSize: 13, outline: "none", fontFamily: "'DM Sans', sans-serif" }} />
+              <button onClick={() => { if (newVendor.trim()) { set("vendors", [...settings.vendors, newVendor.trim()]); setNewVendor(""); } }} style={{ background: C.navy, border: "none", color: C.gold, borderRadius: 8, padding: "9px 14px", fontWeight: 700, cursor: "pointer" }}>Add</button>
+            </div>
+          </div>
+        </>
+      )}
       <p style={{ fontSize: 10, color: C.textMuted, textAlign: "center", marginTop: 24 }}>InventoryIQ · part of the FoodSafeIQ family</p>
     </div>
   );
@@ -2008,7 +2171,147 @@ const NAV = [
   { key: "settings",  label: "Settings",icon: "gear" },
 ];
 
-export default function App() {
+const GLOBAL_STYLE = `
+  @import url('https://fonts.googleapis.com/css2?family=DM+Serif+Display:ital@0;1&family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700;0,9..40,800;1,9..40,400&display=swap');
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; margin: 0; padding: 0; }
+  html { -webkit-overflow-scrolling: touch; }
+  body { background: ${C.bg}; font-family: 'DM Sans', sans-serif; overscroll-behavior-y: none; }
+  button, select, input { font-family: 'DM Sans', sans-serif; }
+  ::-webkit-scrollbar { display: none; }
+  button { transition: transform 120ms ${EASE}, opacity 120ms ${EASE}; }
+  button:active { transform: scale(0.96); opacity: 0.92; }
+  button:disabled:active { transform: none; opacity: 1; }
+  [data-tap]:active { transform: scale(0.98); opacity: 0.94; }
+  [data-tap] { transition: transform 120ms ${EASE}, opacity 120ms ${EASE}; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  @keyframes iiqScreenIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+  @keyframes iiqSheetUp { from { transform: translateY(100%); } to { transform: translateY(0); } }
+  @keyframes iiqBackdropIn { from { opacity: 0; } to { opacity: 1; } }
+  @keyframes iiqPopIn { from { opacity: 0; transform: scale(0.94); } to { opacity: 1; transform: scale(1); } }
+`;
+
+const LoadingSplash = ({ label }) => (
+  <>
+    <style>{GLOBAL_STYLE}</style>
+    <div style={{ minHeight: "100vh", background: C.navy, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 18, fontFamily: "'DM Sans', sans-serif" }}>
+      <BrandMark size={48} />
+      <div style={{ width: 28, height: 28, border: `3px solid ${C.gold}33`, borderTopColor: C.gold, borderRadius: "50%", animation: "spin 0.8s linear infinite" }} />
+      <p style={{ color: "#ffffffaa", fontSize: 13 }}>{label}</p>
+    </div>
+  </>
+);
+
+const authInputStyle = { width: "100%", background: "#ffffff12", border: "1px solid #ffffff33", borderRadius: 10, padding: "12px 14px", color: "#fff", fontSize: 14, outline: "none", fontFamily: "'DM Sans', sans-serif" };
+
+// ─── SCREEN: Sign in / sign up ────────────────────────────────────────────────
+// Deliberately simple, per product decision: Supabase Auth handles identity, and every
+// account either signs in to an existing organization or signs up and then redeems an
+// invite/join code (see JoinOrgScreen) -- there's no separate "create a new organization"
+// self-serve flow. onAuthStateChange in the App root below picks up the resulting session
+// automatically, so this component doesn't need to manage that transition itself.
+const AuthScreen = () => {
+  const [mode, setMode] = useState("signin"); // signin | signup
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [confirmSent, setConfirmSent] = useState(false);
+
+  const submit = async () => {
+    setError(""); setBusy(true);
+    try {
+      const sb = getSupabaseBrowserClient();
+      if (mode === "signin") {
+        const { error } = await sb.auth.signInWithPassword({ email: email.trim(), password });
+        if (error) throw error;
+      } else {
+        const { data, error } = await sb.auth.signUp({ email: email.trim(), password });
+        if (error) throw error;
+        if (!data.session) { setConfirmSent(true); } // email confirmation required before session exists
+      }
+    } catch (e) {
+      setError(e.message || "Something went wrong");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  if (confirmSent) {
+    return (
+      <>
+        <style>{GLOBAL_STYLE}</style>
+        <div style={{ minHeight: "100vh", background: C.navy, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 14, padding: 24, textAlign: "center" }}>
+          <BrandMark size={44} />
+          <p style={{ color: "#fff", fontWeight: 700, fontSize: 16, fontFamily: "'DM Serif Display', serif" }}>Check your email</p>
+          <p style={{ color: "#ffffffaa", fontSize: 13, maxWidth: 280, lineHeight: 1.6 }}>We sent a confirmation link to {email}. Click it, then come back here and sign in.</p>
+          <button onClick={() => { setConfirmSent(false); setMode("signin"); }} style={{ background: "none", border: "none", color: C.gold, fontWeight: 700, fontSize: 13, cursor: "pointer" }}>Back to sign in</button>
+        </div>
+      </>
+    );
+  }
+
+  return (
+    <>
+      <style>{GLOBAL_STYLE}</style>
+      <div style={{ minHeight: "100vh", background: C.navy, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", padding: 24 }}>
+        <BrandMark size={48} />
+        <h1 style={{ margin: "14px 0 2px", fontSize: 26, fontWeight: 400, color: "#fff", fontFamily: "'DM Serif Display', serif" }}>Inventory<span style={{ color: C.gold }}>IQ</span></h1>
+        <p style={{ color: "#ffffffaa", fontSize: 12, marginBottom: 28 }}>{mode === "signin" ? "Sign in to your organization" : "Create your account"}</p>
+        <div style={{ width: "100%", maxWidth: 320, display: "flex", flexDirection: "column", gap: 12 }}>
+          <input type="email" autoCapitalize="none" value={email} onChange={e => setEmail(e.target.value)} placeholder="Email" style={authInputStyle} />
+          <input type="password" value={password} onChange={e => setPassword(e.target.value)} placeholder="Password" onKeyDown={e => e.key === "Enter" && submit()} style={authInputStyle} />
+          {error && <p style={{ color: "#ff8a80", fontSize: 12, margin: 0 }}>{error}</p>}
+          <GoldBtn onClick={submit} disabled={busy || !email.trim() || !password}>{busy ? "…" : mode === "signin" ? "Sign In" : "Create Account"}</GoldBtn>
+          <button onClick={() => { setMode(m => m === "signin" ? "signup" : "signin"); setError(""); }} style={{ background: "none", border: "none", color: "#ffffffaa", fontSize: 12, cursor: "pointer", marginTop: 4 }}>
+            {mode === "signin" ? "New here? Create an account" : "Already have an account? Sign in"}
+          </button>
+        </div>
+      </div>
+    </>
+  );
+};
+
+// ─── SCREEN: Redeem an invite/join code (shown once signed in but not yet in an org) ──
+const JoinOrgScreen = ({ email, onJoined, onSignOut }) => {
+  const [code, setCode] = useState("");
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  const submit = async () => {
+    if (!code.trim()) return;
+    setError(""); setBusy(true);
+    try {
+      await redeemJoinCode(code.trim());
+      onJoined();
+    } catch (e) {
+      setError(e.message || "Could not join that organization");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <>
+      <style>{GLOBAL_STYLE}</style>
+      <div style={{ minHeight: "100vh", background: C.bg, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", padding: 24 }}>
+        <BrandMark size={44} />
+        <p style={{ color: C.navy, fontWeight: 700, fontSize: 17, margin: "14px 0 4px", fontFamily: "'DM Serif Display', serif" }}>One more step</p>
+        <p style={{ color: C.textSub, fontSize: 13, textAlign: "center", maxWidth: 300, marginBottom: 20, lineHeight: 1.6 }}>
+          Signed in as {email}. Enter the join code a manager shared with you to get into their organization.
+        </p>
+        <div style={{ width: "100%", maxWidth: 300, display: "flex", flexDirection: "column", gap: 12 }}>
+          <input value={code} onChange={e => setCode(e.target.value.toUpperCase())} onKeyDown={e => e.key === "Enter" && submit()} placeholder="JOIN CODE"
+            style={{ width: "100%", background: C.card, border: `1px solid ${C.borderDark}`, borderRadius: 10, padding: "12px 14px", color: C.text, fontSize: 16, fontWeight: 700, letterSpacing: "0.1em", textAlign: "center", outline: "none", fontFamily: "'DM Sans', sans-serif" }} />
+          {error && <p style={{ color: C.red, fontSize: 12, margin: 0, textAlign: "center" }}>{error}</p>}
+          <PrimaryBtn onClick={submit} disabled={busy || !code.trim()}>{busy ? "Joining…" : "Join Organization"}</PrimaryBtn>
+          <button onClick={onSignOut} style={{ background: "none", border: "none", color: C.textSub, fontSize: 12, cursor: "pointer" }}>Sign out</button>
+        </div>
+      </div>
+    </>
+  );
+};
+
+const AppShell = ({ auth, onSignOut }) => {
   const [screen, setScreen] = useState("dashboard");
   const [settings, setSettings] = useState(DEFAULT_SETTINGS);
   const [locations, setLocations] = useState([]);
@@ -2032,23 +2335,12 @@ export default function App() {
 
   useEffect(() => { fetchCatalog(); }, []);
 
-  if (catalogState === "loading") {
-    return (
-      <>
-        <style>{`@import url('https://fonts.googleapis.com/css2?family=DM+Serif+Display:ital@0;1&family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,700&display=swap'); * { margin:0; padding:0; box-sizing:border-box; } @keyframes spin { to { transform: rotate(360deg); } }`}</style>
-        <div style={{ minHeight: "100vh", background: C.navy, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 18, fontFamily: "'DM Sans', sans-serif" }}>
-          <BrandMark size={48} />
-          <div style={{ width: 28, height: 28, border: `3px solid ${C.gold}33`, borderTopColor: C.gold, borderRadius: "50%", animation: "spin 0.8s linear infinite" }} />
-          <p style={{ color: "#ffffffaa", fontSize: 13 }}>Loading your catalog…</p>
-        </div>
-      </>
-    );
-  }
+  if (catalogState === "loading") return <LoadingSplash label="Loading your catalog…" />;
 
   if (catalogState === "error") {
     return (
       <>
-        <style>{`@import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;700&display=swap'); * { margin:0; padding:0; box-sizing:border-box; }`}</style>
+        <style>{GLOBAL_STYLE}</style>
         <div style={{ minHeight: "100vh", background: C.bg, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 14, padding: 24, textAlign: "center", fontFamily: "'DM Sans', sans-serif" }}>
           <BrandMark size={44} />
           <p style={{ color: C.navy, fontWeight: 700, fontSize: 16 }}>Couldn't load your catalog</p>
@@ -2061,12 +2353,12 @@ export default function App() {
 
   const screens = {
     dashboard: <Dashboard locations={locations} items={items} assignments={assignments} navigate={setScreen} />,
-    sites:     <SitesScreen locations={locations} setLocations={setLocations} settings={settings} />,
-    catalog:   <CatalogScreen items={items} setItems={setItems} assignments={assignments} setAssignments={setAssignments} locations={locations} settings={settings} setSettings={setSettings} />,
+    sites:     <SitesScreen locations={locations} setLocations={setLocations} settings={settings} role={auth.role} />,
+    catalog:   <CatalogScreen items={items} setItems={setItems} assignments={assignments} setAssignments={setAssignments} locations={locations} settings={settings} setSettings={setSettings} role={auth.role} />,
     capture:   <CaptureScreen locations={locations} items={items} assignments={assignments} stages={stages} setStages={setStages} settings={settings} navigate={setScreen} onComplete={(r, m) => { setCountItems(r); setCountMeta(m); }} />,
     review:    <ReviewScreen navigate={setScreen} countItems={countItems} setCountItems={setCountItems} countMeta={countMeta} settings={settings} items={items} setItems={setItems} assignments={assignments} setAssignments={setAssignments} />,
-    orders:    <OrdersScreen countItems={countItems} items={items} assignments={assignments} />,
-    settings:  <SettingsScreen settings={settings} setSettings={setSettings} />,
+    orders:    <OrdersScreen countItems={countItems} items={items} assignments={assignments} role={auth.role} />,
+    settings:  <SettingsScreen settings={settings} setSettings={setSettings} auth={auth} onSignOut={onSignOut} />,
   };
 
   const activeNavIndex = NAV.findIndex(n =>
@@ -2075,28 +2367,7 @@ export default function App() {
 
   return (
     <>
-      <style>{`
-        @import url('https://fonts.googleapis.com/css2?family=DM+Serif+Display:ital@0;1&family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700;0,9..40,800;1,9..40,400&display=swap');
-        * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; margin: 0; padding: 0; }
-        html { -webkit-overflow-scrolling: touch; }
-        body { background: ${C.bg}; font-family: 'DM Sans', sans-serif; overscroll-behavior-y: none; }
-        button, select, input { font-family: 'DM Sans', sans-serif; }
-        ::-webkit-scrollbar { display: none; }
-
-        /* Native-feel tap response: every button compresses slightly on press. */
-        button { transition: transform 120ms ${EASE}, opacity 120ms ${EASE}; }
-        button:active { transform: scale(0.96); opacity: 0.92; }
-        button:disabled:active { transform: none; opacity: 1; }
-
-        [data-tap]:active { transform: scale(0.98); opacity: 0.94; }
-        [data-tap] { transition: transform 120ms ${EASE}, opacity 120ms ${EASE}; }
-
-        @keyframes spin { to { transform: rotate(360deg); } }
-        @keyframes iiqScreenIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
-        @keyframes iiqSheetUp { from { transform: translateY(100%); } to { transform: translateY(0); } }
-        @keyframes iiqBackdropIn { from { opacity: 0; } to { opacity: 1; } }
-        @keyframes iiqPopIn { from { opacity: 0; transform: scale(0.94); } to { opacity: 1; transform: scale(1); } }
-      `}</style>
+      <style>{GLOBAL_STYLE}</style>
       <div style={{ maxWidth: 430, margin: "0 auto", minHeight: "100vh", background: C.bg }}>
         <div key={screen} style={{ overflowY: "auto", height: "100vh", paddingBottom: 80, animation: `iiqScreenIn 260ms ${EASE}` }}>{screens[screen]}</div>
         <div style={{ position: "fixed", bottom: 0, left: "50%", transform: "translateX(-50%)", width: "100%", maxWidth: 430, background: C.navy, display: "flex", padding: "10px 0 22px", zIndex: 100, boxShadow: "0 -2px 12px rgba(13,27,42,0.15)" }}>
@@ -2123,4 +2394,43 @@ export default function App() {
       </div>
     </>
   );
+};
+
+// ─── App root: auth gate ──────────────────────────────────────────────────────
+// Nothing in AppShell renders until there's both a live Supabase Auth session AND
+// confirmed organization membership -- "full auth gate on everything", per product
+// decision, rather than rolling this out screen-by-screen.
+export default function App() {
+  const [phase, setPhase] = useState("loading"); // loading | signedOut | needsOrg | ready
+  const [me, setMe] = useState(null); // { userId, email, orgId, orgName, role }
+
+  const refreshWhoAmI = () => {
+    fetchWhoAmI()
+      .then(m => { setMe(m); setPhase(m.orgId ? "ready" : "needsOrg"); })
+      .catch(() => setPhase("signedOut"));
+  };
+
+  useEffect(() => {
+    const sb = getSupabaseBrowserClient();
+    let cancelled = false;
+
+    sb.auth.getSession().then(({ data }) => {
+      if (cancelled) return;
+      if (data.session) refreshWhoAmI(); else setPhase("signedOut");
+    });
+
+    // Covers sign-in, sign-out, and token refresh from anywhere (including the AuthScreen
+    // and JoinOrgScreen components below, which don't call back into this component directly).
+    const { data: sub } = sb.auth.onAuthStateChange((_event, session) => {
+      if (session) refreshWhoAmI(); else { setMe(null); setPhase("signedOut"); }
+    });
+
+    return () => { cancelled = true; sub.subscription.unsubscribe(); };
+  }, []);
+
+  if (phase === "loading") return <LoadingSplash label="Signing you in…" />;
+  if (phase === "signedOut") return <AuthScreen />;
+  if (phase === "needsOrg") return <JoinOrgScreen email={me?.email} onJoined={refreshWhoAmI} onSignOut={() => getSupabaseBrowserClient().auth.signOut()} />;
+
+  return <AppShell auth={me} onSignOut={() => getSupabaseBrowserClient().auth.signOut()} />;
 }
