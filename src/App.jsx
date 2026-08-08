@@ -269,17 +269,20 @@ async function sha256Hex(blob) {
 }
 
 // ─── Backend proxy: count session lifecycle ──────────────────────────────────
+// All four of these hit /api/count-session (one file, routed by `action`) rather than
+// four separate endpoint files -- Vercel's Hobby plan caps a deployment at 12 Serverless
+// Functions, and four new files would have pushed this project over that limit outright.
 async function startCountSession(areaId) {
-  const res = await fetch("/api/start-count", {
+  const res = await fetch("/api/count-session", {
     method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ areaId }),
+    body: JSON.stringify({ action: "start", areaId }),
   });
   if (!res.ok) { const b = await res.json().catch(() => ({})); throw new Error(b.error || "Could not start count session"); }
   return res.json(); // { countId, resumed }
 }
 
 async function resumeCount(areaId) {
-  const res = await fetch(`/api/resume-count?areaId=${encodeURIComponent(areaId)}`);
+  const res = await fetch(`/api/count-session?areaId=${encodeURIComponent(areaId)}`);
   if (!res.ok) return { resumable: false };
   return res.json(); // { resumable, countId, stageIds, completedStageResults, photos }
 }
@@ -289,9 +292,9 @@ async function resumeCount(areaId) {
 // count_photos for the audit trail. Returns the storage path to hand to
 // analyze-photos once the whole stage's photos are up.
 async function uploadPhotoToStorage({ areaId, stageId, countId, blob, mediaType }) {
-  const urlRes = await fetch("/api/create-photo-upload-url", {
+  const urlRes = await fetch("/api/count-session", {
     method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ areaId, stageId, mediaType }),
+    body: JSON.stringify({ action: "upload-url", areaId, stageId, mediaType }),
   });
   if (!urlRes.ok) { const b = await urlRes.json().catch(() => ({})); throw new Error(b.error || "Could not get upload URL"); }
   const { path, token, bucket } = await urlRes.json();
@@ -303,9 +306,9 @@ async function uploadPhotoToStorage({ areaId, stageId, countId, blob, mediaType 
   ]);
   if (uploadErr) throw new Error(uploadErr.message || "Photo upload failed");
 
-  const recordRes = await fetch("/api/record-stage-photos", {
+  const recordRes = await fetch("/api/count-session", {
     method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ countId, photos: [{ storagePath: path, sha256 }] }),
+    body: JSON.stringify({ action: "record-photos", countId, photos: [{ storagePath: path, sha256 }] }),
   });
   if (!recordRes.ok) { const b = await recordRes.json().catch(() => ({})); throw new Error(b.error || "Photo uploaded but failed to record"); }
 
