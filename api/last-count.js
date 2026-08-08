@@ -43,7 +43,7 @@ export default async function handler(req, res) {
     const count = counts[0];
     const { data: countItems, error: itemsErr } = await supabase
       .from('count_items')
-      .select('item_id, ai_count, manual_override, match_status, confidence')
+      .select('item_id, ai_count, manual_override, match_status, confidence, stage_id')
       .eq('count_id', count.id);
 
     if (itemsErr) {
@@ -51,12 +51,25 @@ export default async function handler(req, res) {
       return;
     }
 
+    // A finalized count can have MULTIPLE rows per item_id: the raw per-stage detection
+    // row(s) written by analyze-photos as the count happened (audit trail, always kept),
+    // plus -- only for items that were cross-stage-merged or not_found -- one additional
+    // reconciled row (stage_id IS NULL) written by finalize-count representing the actual
+    // adjudicated quantity. Take that reconciled row as authoritative when it exists;
+    // otherwise there's exactly one row for that item and it IS authoritative.
+    const byItemId = new Map();
+    for (const ci of countItems || []) {
+      if (!ci.item_id) continue; // "unknown" rows have no item_id -- not relevant as a prior on-hand reference
+      const existing = byItemId.get(ci.item_id);
+      if (!existing || existing.stage_id !== null) byItemId.set(ci.item_id, ci); // prefer the stage_id-NULL row if we find one
+    }
+
     res.status(200).json({
       lastCount: {
         id: count.id,
         status: count.status,
         date: count.finalized_at || count.started_at,
-        items: (countItems || []).map((ci) => ({
+        items: Array.from(byItemId.values()).map((ci) => ({
           itemId: ci.item_id,
           onHand: ci.manual_override ?? ci.ai_count,
         })),

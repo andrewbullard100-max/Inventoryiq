@@ -1,4 +1,5 @@
 import { useState, useRef, useEffect } from "react";
+import { createClient } from "@supabase/supabase-js";
 
 // ═══ InventoryIQ — FoodSafeIQ family design system (matched to the real app) ═══
 // Navy #0d1b2a · Navy-mid #1F3864 · Gold #C9A84C · Cream #F2F0EB
@@ -199,34 +200,43 @@ const GoldBtn = ({ children, onClick, disabled, style = {} }) => (
 
 // ─── Backend proxy: Claude Vision photo analysis (area-scoped) ──────────────
 // Calls YOUR backend (/api/analyze-photos), never Anthropic directly -- the
-// backend holds the item list for this area itself, keyed by areaId.
-async function analysePhotosViaBackend(images, areaId) {
-  const imagePayload = images.map(img => {
-    const [header, data] = img.src.split(",");
-    return { mediaType: header.match(/data:(.*);base64/)?.[1] || "image/jpeg", data };
-  });
-
+// backend holds the item list for this area itself, keyed by areaId. Photos
+// are no longer sent in this request body at all (see uploadPhotoToStorage
+// below) -- only the storage paths of photos already uploaded. That's what
+// removes the 4.5MB body ceiling and makes several-hundred-photo counts
+// practical: nothing photo-sized ever needs to fit in one function's body.
+// Retries with backoff on 429/5xx, since a several-dozen-stage count firing
+// concurrent requests will occasionally get rate-limited or hit a transient
+// error, and that shouldn't fail the whole count.
+async function analysePhotosViaBackend({ storagePaths, areaId, countId, stageId, stageName }, attempt = 1) {
   const res = await fetch("/api/analyze-photos", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ areaId, images: imagePayload }),
+    body: JSON.stringify({ areaId, countId, stageId, stageName, storagePaths }),
   });
   if (!res.ok) {
+    if ((res.status === 429 || res.status >= 500) && attempt <= 4) {
+      const delay = Math.min(1500 * 2 ** (attempt - 1), 12000) + Math.random() * 300;
+      await new Promise(r => setTimeout(r, delay));
+      return analysePhotosViaBackend({ storagePaths, areaId, countId, stageId, stageName }, attempt + 1);
+    }
     const body = await res.json().catch(() => ({}));
     throw new Error(body.error || `Analysis failed (${res.status})`);
   }
-  return res.json(); // { areaId, results: [{itemId,name,aiCount,confidence,matchStatus}], unrecognizedItems, model }
+  return res.json(); // { areaId, countId, stageId, results: [{itemId,name,aiCount,confidence,matchStatus,dbId}], model, persisted }
 }
 
 // Adapts the backend's response into the count-sheet row shape the Review
 // screen already expects, filling in sku/size/unit/price/par from the area's
 // already-loaded item list (the backend only returns id/count/confidence).
+// dbId is carried through so overrides/finalize can target the exact
+// count_items row this came from instead of re-matching by itemId.
 function adaptAnalysisResults(backendResults, areaItems) {
   const byId = new Map(areaItems.map(i => [i.id, i]));
   return backendResults.results.map(r => {
     const it = byId.get(r.itemId);
     return {
-      key: uid("ci"), itemId: r.itemId, sku: it?.sku || r.itemId, name: r.name || it?.name || "Unknown item",
+      key: uid("ci"), itemId: r.itemId, dbId: r.dbId || null, sku: it?.sku || r.itemId, name: r.name || it?.name || "Unknown item",
       size: it?.size || "", aiCount: Math.max(0, Math.round(r.aiCount || 0)),
       par: it?.par ?? null, confidence: Math.min(1, Math.max(0, r.confidence || 0)),
       unit: it?.unit || "units", price: it?.price || 0,
@@ -234,6 +244,88 @@ function adaptAnalysisResults(backendResults, areaItems) {
       override: null, confirmed: false,
     };
   });
+}
+
+// ─── Storage-uploaded photo capture ──────────────────────────────────────────
+// Lazily-created browser Supabase client, used ONLY for uploading directly to
+// a signed Storage URL. It's initialized with the public anon key (safe to
+// expose -- same trust level as any public API key), never the service role
+// key, which stays server-side. Requires VITE_SUPABASE_URL and
+// VITE_SUPABASE_ANON_KEY to be set in the Vercel project's env vars.
+let _sb = null;
+function getSupabaseBrowserClient() {
+  if (_sb) return _sb;
+  const url = import.meta.env.VITE_SUPABASE_URL;
+  const key = import.meta.env.VITE_SUPABASE_ANON_KEY;
+  if (!url || !key) throw new Error("Photo upload isn't configured yet (missing VITE_SUPABASE_URL / VITE_SUPABASE_ANON_KEY).");
+  _sb = createClient(url, key);
+  return _sb;
+}
+
+async function sha256Hex(blob) {
+  const buf = await blob.arrayBuffer();
+  const digest = await crypto.subtle.digest("SHA-256", buf);
+  return Array.from(new Uint8Array(digest)).map(b => b.toString(16).padStart(2, "0")).join("");
+}
+
+// ─── Backend proxy: count session lifecycle ──────────────────────────────────
+async function startCountSession(areaId) {
+  const res = await fetch("/api/start-count", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ areaId }),
+  });
+  if (!res.ok) { const b = await res.json().catch(() => ({})); throw new Error(b.error || "Could not start count session"); }
+  return res.json(); // { countId, resumed }
+}
+
+async function resumeCount(areaId) {
+  const res = await fetch(`/api/resume-count?areaId=${encodeURIComponent(areaId)}`);
+  if (!res.ok) return { resumable: false };
+  return res.json(); // { resumable, countId, stageIds, completedStageResults, photos }
+}
+
+// Uploads one already-compressed photo directly to Supabase Storage via a
+// signed URL (never through this app's own API body), then records it in
+// count_photos for the audit trail. Returns the storage path to hand to
+// analyze-photos once the whole stage's photos are up.
+async function uploadPhotoToStorage({ areaId, stageId, countId, blob, mediaType }) {
+  const urlRes = await fetch("/api/create-photo-upload-url", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ areaId, stageId, mediaType }),
+  });
+  if (!urlRes.ok) { const b = await urlRes.json().catch(() => ({})); throw new Error(b.error || "Could not get upload URL"); }
+  const { path, token, bucket } = await urlRes.json();
+
+  const sb = getSupabaseBrowserClient();
+  const [{ error: uploadErr }, sha256] = await Promise.all([
+    sb.storage.from(bucket).uploadToSignedUrl(path, token, blob, { contentType: mediaType }),
+    sha256Hex(blob),
+  ]);
+  if (uploadErr) throw new Error(uploadErr.message || "Photo upload failed");
+
+  const recordRes = await fetch("/api/record-stage-photos", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ countId, photos: [{ storagePath: path, sha256 }] }),
+  });
+  if (!recordRes.ok) { const b = await recordRes.json().catch(() => ({})); throw new Error(b.error || "Photo uploaded but failed to record"); }
+
+  return path;
+}
+
+// Runs `worker` over `items` with at most `limit` in flight at once. Used to
+// analyze several stages in parallel (instead of one strictly sequential
+// loop) without firing 40+ requests at the Anthropic API simultaneously.
+async function runWithConcurrency(items, limit, worker) {
+  const results = new Array(items.length);
+  let next = 0;
+  async function runNext() {
+    while (next < items.length) {
+      const i = next++;
+      results[i] = await worker(items[i], i);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, runNext));
+  return results;
 }
 
 // ─── Backend proxy: vendor invoice parsing ───────────────────────────────────
@@ -386,13 +478,24 @@ async function removeAssignmentFromBackend(itemId, areaId) {
   return res.json();
 }
 
-// ─── Backend proxy: finalize a count session (this is what actually saves it) ─
-async function finalizeCountToBackend(areaId, requireApproval, items) {
+// ─── Backend proxy: finalize a count session (this locks in overrides + not_found) ─
+// countId must be the session created by start-count / returned in countMeta --
+// analyze-photos already persisted every stage's detections as the count happened,
+// so this call's job is just to apply overrides and reconcile not_found once, then
+// lock the session. sourceRowIds lets the backend tell a single-stage detection
+// (one row, gets an UPDATE) apart from a cross-stage merge or not_found item
+// (zero or multiple rows, gets a new reconciled row) -- see finalize-count.js.
+async function finalizeCountToBackend(countId, areaId, requireApproval, items) {
   const res = await fetch("/api/finalize-count", {
     method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
-      areaId, requireApproval,
-      items: items.map(i => ({ itemId: i.itemId || i.sku, aiCount: i.aiCount, confidence: i.confidence, matchStatus: i.matchStatus, override: i.override, stageId: i.stageId, stageName: i.stageName })),
+      countId, areaId, requireApproval,
+      finalItems: items.map(i => ({
+        itemId: i.itemId || null,
+        aiCount: i.aiCount, confidence: i.confidence, matchStatus: i.matchStatus,
+        override: i.override, note: i.notes || "",
+        sourceRowIds: i.sourceRowIds || [],
+      })),
     }),
   });
   if (!res.ok) {
@@ -1055,12 +1158,17 @@ const InvoiceModal = ({ onClose, onImport, existingSkus }) => {
 };
 
 // ─── SCREEN: Capture ──────────────────────────────────────────────────────────
-// Resizes + compresses a photo client-side before it's base64-encoded and
-// sent to the backend. Claude Vision doesn't benefit from anything larger
-// than ~1568px on the long edge, and Vercel serverless functions hard-cap
-// request bodies at 4.5MB -- full-res phone photos (esp. multiple at once)
-// blow past that and get rejected with a 413 before our code even runs.
-function resizeImageFile(file, maxDim = 1568, quality = 0.9) {
+// Produces two things from a captured photo: an upload-quality Blob (what
+// actually gets sent to Storage/Claude) and a small on-screen thumbnail
+// (what stays in React state). Photos now go straight to Supabase Storage via
+// a signed URL rather than through this app's own API body, so there's no
+// 4.5MB ceiling driving the resolution choice anymore -- upload quality is
+// set by what Claude Vision can actually use (Sonnet 5's high-resolution
+// tier goes up to ~2576px on the long edge), not by a request-body limit.
+// The thumbnail, not the full photo, is what a several-hundred-photo count
+// keeps in memory across its whole capture session -- that's the difference
+// that keeps a long real-world count from running the tab out of memory.
+function processPhotoForCapture(file, { uploadMaxDim = 2200, uploadQuality = 0.85, thumbMaxDim = 180, thumbQuality = 0.55 } = {}) {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
     reader.onerror = () => reject(new Error("Could not read file"));
@@ -1068,16 +1176,23 @@ function resizeImageFile(file, maxDim = 1568, quality = 0.9) {
       const img = new Image();
       img.onerror = () => reject(new Error("Could not read image"));
       img.onload = () => {
-        let { width, height } = img;
-        if (width > maxDim || height > maxDim) {
-          const scale = maxDim / Math.max(width, height);
-          width = Math.round(width * scale);
-          height = Math.round(height * scale);
-        }
-        const canvas = document.createElement("canvas");
-        canvas.width = width; canvas.height = height;
-        canvas.getContext("2d").drawImage(img, 0, 0, width, height);
-        resolve(canvas.toDataURL("image/jpeg", quality));
+        const render = (maxDim, quality, asBlob) => new Promise((res) => {
+          let { width, height } = img;
+          if (width > maxDim || height > maxDim) {
+            const scale = maxDim / Math.max(width, height);
+            width = Math.round(width * scale);
+            height = Math.round(height * scale);
+          }
+          const canvas = document.createElement("canvas");
+          canvas.width = width; canvas.height = height;
+          canvas.getContext("2d").drawImage(img, 0, 0, width, height);
+          if (asBlob) canvas.toBlob((blob) => res(blob), "image/jpeg", quality);
+          else res(canvas.toDataURL("image/jpeg", quality));
+        });
+        Promise.all([
+          render(uploadMaxDim, uploadQuality, true),
+          render(thumbMaxDim, thumbQuality, false),
+        ]).then(([blob, thumbDataUrl]) => resolve({ blob, mediaType: "image/jpeg", thumbDataUrl }));
       };
       img.src = e.target.result;
     };
@@ -1089,7 +1204,7 @@ const CaptureScreen = ({ locations, items, assignments, stages, setStages, setti
   const [locId, setLocId] = useState(locations[0]?.id || "");
   const [areaId, setAreaId] = useState("");
   const [phase, setPhase] = useState("ready");
-  const [stageList, setStageList] = useState([]); // [{ id, name, images: [] }]
+  const [stageList, setStageList] = useState([]); // [{ id, name, images: [{id, thumbDataUrl, name, sizeKB, status, storagePath}] }]
   const [preview, setPreview] = useState(null);
   const [progress, setProgress] = useState(0);
   const [stageProgressLabel, setStageProgressLabel] = useState("");
@@ -1099,12 +1214,21 @@ const CaptureScreen = ({ locations, items, assignments, stages, setStages, setti
   const fileRefs = useRef({}); const camRefs = useRef({});
   const [lastCount, setLastCount] = useState(null);
 
+  // Count-session state: created (or resumed) as soon as the first photo is captured,
+  // not only at the very end -- this is what lets every stage persist as it happens.
+  const [countId, setCountId] = useState(null);
+  const [completedStageIds, setCompletedStageIds] = useState(new Set());
+  const [resumeBanner, setResumeBanner] = useState(null); // { countId, stageCount } | null
+  const uploadPromisesRef = useRef({}); // imgId -> Promise<storagePath>
+
   const loc = locations.find(l => l.id === locId) || locations[0];
   const areas = loc?.areas || [];
   const area = areas.find(a => a.id === areaId) || areas[0];
   const totalImages = stageList.reduce((s, st) => s + st.images.length, 0);
   const activeStageCount = stageList.filter(s => s.images.length > 0).length;
-  const canProcess = totalImages > 0 && phase === "ready" && !!area;
+  const uploadingCount = stageList.reduce((s, st) => s + st.images.filter(i => i.status === "uploading").length, 0);
+  const failedUploadCount = stageList.reduce((s, st) => s + st.images.filter(i => i.status === "error").length, 0);
+  const canProcess = totalImages > 0 && phase === "ready" && !!area && failedUploadCount === 0;
 
   useEffect(() => {
     if (!area) { setLastCount(null); return; }
@@ -1114,12 +1238,25 @@ const CaptureScreen = ({ locations, items, assignments, stages, setStages, setti
   }, [area?.id]);
 
   // Seed stages from what was persisted for this area last time -- names stick around session to session.
+  // Also check for an in-progress count left over from a dropped connection / closed tab, so a
+  // several-hundred-photo count doesn't have to restart from zero after an interruption.
   useEffect(() => {
+    setCountId(null); setCompletedStageIds(new Set()); setResumeBanner(null); uploadPromisesRef.current = {};
     if (!area) { setStageList([]); return; }
     const persisted = stages.filter(s => s.areaId === area.id).sort((a, b) => a.sortOrder - b.sortOrder);
     setStageList(persisted.length > 0
       ? persisted.map(s => ({ id: s.id, name: s.name, images: [] }))
       : [{ id: uid("stage"), name: "Stage 1", images: [] }]);
+
+    let cancelled = false;
+    resumeCount(area.id).then(r => {
+      if (cancelled || !r.resumable) return;
+      const stageIdsWithResults = new Set((r.completedStageResults || []).map(i => i.stage_id));
+      setCountId(r.countId);
+      setCompletedStageIds(stageIdsWithResults);
+      if (stageIdsWithResults.size > 0) setResumeBanner({ countId: r.countId, stageCount: stageIdsWithResults.size });
+    }).catch(() => {});
+    return () => { cancelled = true; };
   }, [area?.id]);
 
   // Area-scoped reference list for Claude
@@ -1132,37 +1269,61 @@ const CaptureScreen = ({ locations, items, assignments, stages, setStages, setti
   const removeStage = (stageId) => setStageList(prev => prev.length > 1 ? prev.filter(s => s.id !== stageId) : prev);
   const renameStage = (stageId, name) => setStageList(prev => prev.map(s => s.id === stageId ? { ...s, name } : s));
 
-  const handleFiles = (stageId, files) => {
+  const patchImage = (stageId, imgId, patch) =>
+    setStageList(prev => prev.map(s => s.id === stageId ? { ...s, images: s.images.map(i => i.id === imgId ? { ...i, ...patch } : i) } : s));
+
+  // Captures a photo, shows it immediately (via the small thumbnail), and kicks off its
+  // upload to Storage in the background right away -- not batched until "Process". That's
+  // what bounds memory across a long count: by the time someone's five stages deep, the
+  // early stages' full-resolution photos are already off the device, only a thumbnail and
+  // a storage path remain in state.
+  const handleFiles = async (stageId, files) => {
     const valid = Array.from(files).filter(f => f.type.startsWith("image/"));
-    Promise.all(valid.map(async file => {
+    if (valid.length === 0) return;
+
+    // Lazily start (or resume) the count session on first photo of the whole area capture.
+    let cid = countId;
+    if (!cid) {
+      try { const started = await startCountSession(area.id); cid = started.countId; setCountId(cid); }
+      catch (e) { setErrorMsg(e.message || "Could not start this count session."); return; }
+    }
+
+    for (const file of valid) {
+      const imgId = uid("img");
+      let entry;
       try {
-        const dataUrl = await resizeImageFile(file);
-        const approxBytes = Math.round((dataUrl.length - dataUrl.indexOf(",") - 1) * 0.75);
-        return { id: uid("img"), src: dataUrl, name: file.name, size: (approxBytes / 1024).toFixed(0) + " KB" };
-      } catch {
-        return new Promise(res => {
-          const r = new FileReader();
-          r.onload = e => res({ id: uid("img"), src: e.target.result, name: file.name, size: (file.size / 1024).toFixed(0) + " KB" });
-          r.readAsDataURL(file);
-        });
+        const { blob, mediaType, thumbDataUrl } = await processPhotoForCapture(file);
+        entry = { id: imgId, thumbDataUrl, name: file.name, sizeKB: Math.round(blob.size / 1024), status: "uploading", storagePath: null };
+        setStageList(prev => prev.map(s => s.id === stageId ? { ...s, images: [...s.images, entry].slice(0, 5) } : s));
+
+        const uploadPromise = uploadPhotoToStorage({ areaId: area.id, stageId, countId: cid, blob, mediaType })
+          .then(path => { patchImage(stageId, imgId, { status: "uploaded", storagePath: path }); return path; })
+          .catch(err => { patchImage(stageId, imgId, { status: "error", error: err.message }); throw err; });
+        uploadPromisesRef.current[imgId] = uploadPromise;
+      } catch (e) {
+        // processPhotoForCapture itself failed (unreadable file, etc).
+        setStageList(prev => prev.map(s => s.id === stageId ? { ...s, images: [...s.images, { id: imgId, thumbDataUrl: null, name: file.name, sizeKB: 0, status: "error", error: e.message }].slice(0, 5) } : s));
       }
-    })).then(imgs => setStageList(prev => prev.map(s => s.id === stageId ? { ...s, images: [...s.images, ...imgs].slice(0, 5) } : s)));
+    }
   };
 
-  const removeImage = (stageId, imgId) => setStageList(prev => prev.map(s => s.id === stageId ? { ...s, images: s.images.filter(i => i.id !== imgId) } : s));
+  // Note: a failed upload doesn't keep its original blob around (memory reasons), so
+  // there's no "retry" that resends the same bytes -- recovering from a failure just means
+  // removing the failed thumbnail (below) and recapturing the photo.
+  const removeImage = (stageId, imgId) => {
+    delete uploadPromisesRef.current[imgId];
+    setStageList(prev => prev.map(s => s.id === stageId ? { ...s, images: s.images.filter(i => i.id !== imgId) } : s));
+  };
 
   const doProcess = async () => {
     setErrorMsg("");
     const activeStages = stageList.filter(s => s.images.length > 0);
     if (activeStages.length === 0) return;
 
-    for (const s of activeStages) {
-      const bytes = s.images.reduce((sum, img) => sum + Math.round((img.src.length - img.src.indexOf(",") - 1) * 0.75), 0);
-      if (bytes > 4 * 1024 * 1024) {
-        setErrorMsg(`Photos in "${s.name}" are too large to send together (${(bytes / 1024 / 1024).toFixed(1)}MB). Remove a photo from that stage.`);
-        setPhase("error");
-        return;
-      }
+    if (failedUploadCount > 0) {
+      setErrorMsg(`${failedUploadCount} photo(s) failed to upload. Remove them (or re-add) before analyzing.`);
+      setPhase("error");
+      return;
     }
 
     setPhase("processing"); setProgress(0);
@@ -1182,30 +1343,43 @@ const CaptureScreen = ({ locations, items, assignments, stages, setStages, setti
     }
 
     try {
-      const allResults = [];
-      for (let i = 0; i < activeStages.length; i++) {
-        const s = activeStages[i];
-        setStageProgressLabel(`Analysing "${s.name}" (${i + 1} of ${activeStages.length})…`);
-        setProgress(Math.round((i / activeStages.length) * 90));
-        const backendResults = await analysePhotosViaBackend(s.images, area.id);
+      let cid = countId;
+      if (!cid) { const started = await startCountSession(area.id); cid = started.countId; setCountId(cid); }
+
+      // Every photo's upload was kicked off the moment it was captured -- make sure they've
+      // actually landed in Storage (and been recorded) before we try to analyze them.
+      setStageProgressLabel("Finishing photo uploads…");
+      await Promise.all(activeStages.flatMap(s => s.images.map(img => uploadPromisesRef.current[img.id]).filter(Boolean)));
+
+      let completed = 0;
+      const stageResultsList = await runWithConcurrency(activeStages, 3, async (s) => {
+        const storagePaths = s.images.map(img => img.storagePath).filter(Boolean);
+        if (storagePaths.length === 0) return [];
+        const backendResults = await analysePhotosViaBackend({ storagePaths, areaId: area.id, countId: cid, stageId: s.id, stageName: s.name });
+        completed++;
+        setStageProgressLabel(`Analysed ${completed} of ${activeStages.length} stages…`);
+        setProgress(Math.round((completed / activeStages.length) * 90));
         const adapted = adaptAnalysisResults(backendResults, areaItems);
         adapted.forEach(r => { r.stageId = s.id; r.stageName = s.name; });
-        allResults.push(...adapted);
-      }
+        return adapted;
+      });
+      const allResults = stageResultsList.flat();
       setProgress(95);
 
       // Merge across stages: an item seen in only one stage counts normally. An item seen in
       // multiple stages gets flagged for manual review instead of auto-summed -- it may be the
-      // same physical stock double-counted, or genuinely be stored in two places.
+      // same physical stock double-counted, or genuinely be stored in two places. sourceRowIds
+      // tracks exactly which count_items row(s) each merged line came from, so finalize can
+      // apply an override to the right row instead of guessing by itemId.
       const byItemId = new Map();
       const finalResults = [];
       for (const r of allResults) {
-        if (!r.itemId) { finalResults.push(r); continue; } // unrecognized items never dedupe
+        if (!r.itemId) { finalResults.push({ ...r, sourceRowIds: r.dbId ? [r.dbId] : [] }); continue; } // unrecognized items never dedupe
         if (!byItemId.has(r.itemId)) byItemId.set(r.itemId, []);
         byItemId.get(r.itemId).push(r);
       }
       for (const rows of byItemId.values()) {
-        if (rows.length === 1) { finalResults.push(rows[0]); continue; }
+        if (rows.length === 1) { finalResults.push({ ...rows[0], sourceRowIds: rows[0].dbId ? [rows[0].dbId] : [] }); continue; }
         const breakdown = rows.map(r => `${r.stageName} (qty ${r.aiCount})`).join(", ");
         finalResults.push({
           ...rows[0],
@@ -1216,11 +1390,42 @@ const CaptureScreen = ({ locations, items, assignments, stages, setStages, setti
           stageId: null,
           stageName: rows.map(r => r.stageName).join(", "),
           notes: `Seen in multiple stages: ${breakdown} — verify total to avoid double-counting`,
+          sourceRowIds: rows.map(r => r.dbId).filter(Boolean),
         });
       }
 
+      // Reconcile against the full area catalog ONCE, now that every stage has been merged --
+      // not per-stage (that was the old bug: an item absent from a single 5-photo stage isn't
+      // "not found", it might just be in a different stage's photos). Only an item absent from
+      // EVERY stage's results is genuinely not_found for this area. sourceRowIds is empty here
+      // since these rows don't exist in count_items yet -- finalize creates them.
+      const detectedIds = new Set(finalResults.filter(r => r.itemId).map(r => r.itemId));
+      for (const item of areaItems) {
+        if (!detectedIds.has(item.id)) {
+          finalResults.push({
+            key: uid("ci"),
+            itemId: item.id,
+            sku: item.sku || item.id,
+            name: item.name,
+            size: item.size || "",
+            aiCount: 0,
+            par: item.par ?? null,
+            confidence: 0,
+            unit: item.unit || "units",
+            price: item.price || 0,
+            notes: "",
+            matchStatus: "not_found",
+            override: null,
+            confirmed: false,
+            stageId: null,
+            stageName: null,
+            sourceRowIds: [],
+          });
+        }
+      }
+
       setProgress(100); setResultCount(finalResults.length);
-      onComplete(finalResults, { location: loc.name, locationId: loc.id, area: area.name, areaId: area.id, photoCount: totalPhotos, stageCount: activeStages.length });
+      onComplete(finalResults, { location: loc.name, locationId: loc.id, area: area.name, areaId: area.id, photoCount: totalPhotos, stageCount: activeStages.length, countId: cid });
       setTimeout(() => setPhase("done"), 400);
     } catch (e) {
       setProgress(0);
@@ -1260,6 +1465,13 @@ const CaptureScreen = ({ locations, items, assignments, stages, setStages, setti
             <div style={{ padding: "10px 14px", background: C.cardAlt, border: `1px solid ${C.border}`, borderRadius: 10 }}>
               <p style={{ margin: 0, fontSize: 11, color: C.textSub }}>
                 📋 Last counted <strong>{new Date(lastCount.date).toLocaleDateString()}</strong> · {lastCount.items.length} item{lastCount.items.length !== 1 ? "s" : ""} recorded — this new count will be compared against it
+              </p>
+            </div>
+          )}
+          {resumeBanner && (
+            <div style={{ padding: "10px 14px", background: C.blueBg, border: `1px solid ${C.blue}44`, borderRadius: 10 }}>
+              <p style={{ margin: 0, fontSize: 11, color: C.blue, fontWeight: 600 }}>
+                ↻ Picked up an in-progress count for this area — {resumeBanner.stageCount} stage{resumeBanner.stageCount !== 1 ? "s" : ""} already analyzed and saved. Keep capturing the remaining stages below.
               </p>
             </div>
           )}
@@ -1318,12 +1530,25 @@ const CaptureScreen = ({ locations, items, assignments, stages, setStages, setti
                   <div style={{ display: "flex", gap: 8, overflowX: "auto", paddingBottom: 4, marginBottom: 10 }}>
                     {s.images.map((img, idx) => (
                       <div key={img.id} style={{ flexShrink: 0, position: "relative" }}>
-                        <img src={img.src} alt="" onClick={() => setPreview(img.src)} style={{ width: 72, height: 72, borderRadius: 10, objectFit: "cover", border: `2px solid ${C.goldBorder}`, display: "block", cursor: "pointer" }} />
+                        {img.thumbDataUrl
+                          ? <img src={img.thumbDataUrl} alt="" onClick={() => setPreview(img.thumbDataUrl)} style={{ width: 72, height: 72, borderRadius: 10, objectFit: "cover", border: `2px solid ${img.status === "error" ? C.red : C.goldBorder}`, display: "block", cursor: "pointer", opacity: img.status === "uploading" ? 0.6 : 1 }} />
+                          : <div style={{ width: 72, height: 72, borderRadius: 10, border: `2px solid ${C.red}`, background: C.redBg, display: "flex", alignItems: "center", justifyContent: "center" }}><Icon name="close" size={16} color={C.red} /></div>}
+                        {img.status === "uploading" && (
+                          <div style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center" }}>
+                            <div style={{ width: 20, height: 20, borderRadius: "50%", border: "2px solid #ffffff88", borderTopColor: "#fff", animation: "spin 0.8s linear infinite" }} />
+                          </div>
+                        )}
+                        {img.status === "error" && (
+                          <div style={{ position: "absolute", bottom: -4, left: 0, right: 0, textAlign: "center" }}><span style={{ fontSize: 8, color: C.red, fontWeight: 800, background: "#fff", padding: "1px 4px", borderRadius: 4 }}>Failed</span></div>
+                        )}
                         <button onClick={() => removeImage(s.id, img.id)} style={{ position: "absolute", top: -5, right: -5, width: 20, height: 20, borderRadius: "50%", background: C.red, border: "2px solid #fff", display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer" }}><Icon name="close" size={9} color="#fff" /></button>
                         <div style={{ position: "absolute", top: 3, left: 3, width: 16, height: 16, borderRadius: "50%", background: C.navy, display: "flex", alignItems: "center", justifyContent: "center" }}><span style={{ fontSize: 8, color: C.gold, fontWeight: 800 }}>{idx + 1}</span></div>
                       </div>
                     ))}
                   </div>
+                )}
+                {completedStageIds.has(s.id) && s.images.length === 0 && (
+                  <p style={{ margin: "0 0 10px", fontSize: 11, color: C.green, fontWeight: 700 }}>✓ Already analyzed in this count — add photos here only to redo it</p>
                 )}
 
                 <div style={{ display: "flex", gap: 8 }}>
@@ -1338,10 +1563,13 @@ const CaptureScreen = ({ locations, items, assignments, stages, setStages, setti
             <Icon name="plus" size={15} color={C.textSub} />Add Stage
           </button>
 
+          {uploadingCount > 0 && failedUploadCount === 0 && (
+            <p style={{ margin: "0 0 10px", fontSize: 11, color: C.textSub, textAlign: "center" }}>Uploading {uploadingCount} photo{uploadingCount !== 1 ? "s" : ""} in the background — you can keep capturing</p>
+          )}
           <PrimaryBtn onClick={doProcess} disabled={!canProcess}>
             <span style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 10 }}>
               <Icon name="ai" size={20} color={canProcess ? C.gold : C.textMuted} />
-              {canProcess ? `Analyse ${totalImages} Photo${totalImages !== 1 ? "s" : ""} Across ${activeStageCount} Stage${activeStageCount !== 1 ? "s" : ""}` : "Add photos to continue"}
+              {failedUploadCount > 0 ? `${failedUploadCount} photo${failedUploadCount !== 1 ? "s" : ""} failed to upload` : canProcess ? `Analyse ${totalImages} Photo${totalImages !== 1 ? "s" : ""} Across ${activeStageCount} Stage${activeStageCount !== 1 ? "s" : ""}` : "Add photos to continue"}
             </span>
           </PrimaryBtn>
         </>
@@ -1374,6 +1602,7 @@ const ReviewScreen = ({ navigate, countItems, setCountItems, countMeta, settings
 
   // Add unknown item to global master + assign to this area (respecting staffCanAddItems)
   const [reviewSaveError, setReviewSaveError] = useState("");
+  const [pendingCatalogAdds, setPendingCatalogAdds] = useState(0);
 
   const addUnknownToMaster = async (ci) => {
     const newItem = { id: uid("it"), sku: uid("NEW").toUpperCase(), name: ci.name, size: ci.size, unit: ci.unit, vendor: "", price: 0, aliases: "" };
@@ -1381,11 +1610,16 @@ const ReviewScreen = ({ navigate, countItems, setCountItems, countMeta, settings
     setAssignments(prev => [...prev, { id: uid("as"), itemId: newItem.id, locationId: countMeta.locationId, areaId: countMeta.areaId, par: 0 }]);
     update(ci.key, i => ({ ...i, itemId: newItem.id, sku: newItem.sku, matchStatus: "matched", confirmed: true }));
     setAddingUnknown(null);
+    setPendingCatalogAdds(n => n + 1); // block finalize until this item actually exists in Supabase --
+                                        // finalize writes item_id as a foreign key, so finalizing before
+                                        // this lands would fail the constraint.
     try {
       await saveItemsToBackend([{ id: newItem.id, name: newItem.name, vendorItemCode: newItem.sku, orderUom: newItem.unit, packSize: newItem.size }]);
       await saveAssignmentToBackend(newItem.id, countMeta.areaId, 0);
     } catch (e) {
       setReviewSaveError(`Added locally but failed to sync to catalog: ${e.message}`);
+    } finally {
+      setPendingCatalogAdds(n => n - 1);
     }
   };
 
@@ -1395,7 +1629,7 @@ const ReviewScreen = ({ navigate, countItems, setCountItems, countMeta, settings
   const doFinalize = async () => {
     setFinalizing(true); setFinalizeError("");
     try {
-      await finalizeCountToBackend(countMeta.areaId, settings.requireApproval, list);
+      await finalizeCountToBackend(countMeta.countId, countMeta.areaId, settings.requireApproval, list);
       navigate("orders");
     } catch (e) {
       setFinalizeError(e.message || "Could not save this count. Your review is still here — try again.");
@@ -1420,8 +1654,8 @@ const ReviewScreen = ({ navigate, countItems, setCountItems, countMeta, settings
           <p style={{ fontSize: 12, color: C.textSub, margin: "4px 0 0" }}>{countMeta?.area} · {countMeta?.location} · <span style={{ color: C.gold, fontWeight: 700 }}>Claude Vision</span></p>
         </div>
         {confirmed === list.length && (
-          <GoldBtn onClick={doFinalize} disabled={finalizing} style={{ padding: "10px 16px", fontSize: 12, borderRadius: 10 }}>
-            {finalizing ? "Saving…" : settings.requireApproval ? "Submit for Approval" : "Finalize ✓"}
+          <GoldBtn onClick={doFinalize} disabled={finalizing || pendingCatalogAdds > 0} style={{ padding: "10px 16px", fontSize: 12, borderRadius: 10 }}>
+            {finalizing ? "Saving…" : pendingCatalogAdds > 0 ? "Saving new item(s)…" : settings.requireApproval ? "Submit for Approval" : "Finalize ✓"}
           </GoldBtn>
         )}
       </div>
@@ -1503,9 +1737,17 @@ const ReviewScreen = ({ navigate, countItems, setCountItems, countMeta, settings
   );
 };
 
-// ─── SCREEN: Orders (rolls counts up across areas) ────────────────────────────
+// ─── SCREEN: Orders ────────────────────────────────────────────────────────
+// IMPORTANT: countItems currently reflects a SINGLE just-counted area (CaptureScreen's
+// onComplete fully replaces countItems, it doesn't accumulate across areas -- see App
+// state around setCountItems). So this can only correctly operate in "area mode": compare
+// what was counted in THIS area against THIS area's par, using the par already attached to
+// each count item (ci.par, set from that specific area assignment in adaptAnalysisResults).
+// It must NOT sum par across every area the item is assigned to -- that previously produced
+// order quantities inflated by stock already sitting in areas that weren't part of this count.
+// A true multi-area "full location" mode needs countItems to accumulate across every area
+// counted in a session before this can safely roll up total par vs. total on-hand.
 const OrdersScreen = ({ countItems, items, assignments }) => {
-  // Roll up: total par across all assignments per item vs counted on hand
   const counted = (countItems || []).filter(i => i.sku && i.matchStatus !== "unknown");
   const rows = [];
   const bySku = new Map();
@@ -1516,7 +1758,7 @@ const OrdersScreen = ({ countItems, items, assignments }) => {
   });
   bySku.forEach(ci => {
     const masterItem = items.find(i => i.sku === ci.sku);
-    const totalPar = masterItem ? assignments.filter(a => a.itemId === masterItem.id).reduce((s, a) => s + a.par, 0) : (ci.par || 0);
+    const totalPar = ci.par ?? 0; // this area's par only -- see note above
     if (totalPar > ci.totalOnHand) rows.push({ ...ci, totalPar, orderQty: totalPar - ci.totalOnHand, vendor: masterItem?.vendor || "—", cost: (totalPar - ci.totalOnHand) * (ci.price || masterItem?.price || 0) });
   });
   const [selected, setSelected] = useState(rows.map(() => true));
@@ -1525,7 +1767,7 @@ const OrdersScreen = ({ countItems, items, assignments }) => {
   return (
     <div style={{ padding: "24px 16px 100px" }}>
       <h1 style={{ fontSize: 24, fontWeight: 400, color: C.navy, margin: 0, fontFamily: "'DM Serif Display', serif" }}>Purchase Orders</h1>
-      <p style={{ fontSize: 13, color: C.textSub, margin: "4px 0 18px" }}>Counts roll up across all areas vs. total par</p>
+      <p style={{ fontSize: 13, color: C.textSub, margin: "4px 0 18px" }}>Based on your most recent area count vs. that area's par level</p>
 
       {rows.length === 0 ? (
         <div style={{ textAlign: "center", padding: "48px 20px", background: C.card, border: `1px solid ${C.border}`, borderRadius: 16 }}>
@@ -1554,7 +1796,7 @@ const OrdersScreen = ({ countItems, items, assignments }) => {
                     <span style={{ fontSize: 13, fontWeight: 700, color: C.green }}>${r.cost.toFixed(0)}</span>
                   </div>
                   <p style={{ margin: "2px 0 6px", fontSize: 11, color: C.textMuted }}>{r.vendor}</p>
-                  <p style={{ margin: 0, fontSize: 12, color: C.textSub }}>On hand <strong style={{ color: C.red }}>{r.totalOnHand}</strong> · total par <strong>{r.totalPar}</strong> → order <strong style={{ color: C.navy }}>{r.orderQty} {r.unit}</strong></p>
+                  <p style={{ margin: 0, fontSize: 12, color: C.textSub }}>On hand <strong style={{ color: C.red }}>{r.totalOnHand}</strong> · area par <strong>{r.totalPar}</strong> → order <strong style={{ color: C.navy }}>{r.orderQty} {r.unit}</strong></p>
                 </div>
               </div>
             ))}

@@ -3,24 +3,34 @@
 // Body:
 // {
 //   "areaId": "area_xxxxxxxxxxxx",
-//   "images": [ { "mediaType": "image/jpeg", "data": "<base64>" }, ... ]
+//   "countId": "uuid",              -- from /api/start-count
+//   "stageId": "stage_xxx",
+//   "stageName": "Shelf 1",
+//   "storagePaths": [ "area_x/stage_x/169...-ab12.jpg", ... ]  -- from create-photo-upload-url,
+//                                                                already uploaded to Storage
 // }
 //
 // Flow:
 //   1. Look up which items are assigned to this area (and their par levels) in Supabase.
-//   2. Send the photo(s) to Claude Vision along with ONLY that area's item list --
+//   2. Download the photos for this stage from Storage (private bucket, service-role only --
+//      the request body itself now only carries paths, never image bytes, so there's no
+//      practical size ceiling on how many/how large the photos for a stage can be).
+//   3. Send the photo(s) to Claude Vision along with ONLY that area's item list --
 //      this is the area-scoped prompt: Claude never sees the full 1,423-item catalog,
 //      just the ~20-130 items that actually live in this area. Better accuracy, lower cost.
-//   3. Claude returns structured counts. We map its confidence score to one of four
-//      match statuses your app already uses: matched / visual_match / unknown / not_found.
-//   4. Response goes back to the frontend for the Review screen -- nothing is written
-//      to the database here; finalization happens as its own step.
+//   4. Claude returns structured counts. We map its confidence score to one of the match
+//      statuses your app uses (matched / visual_match / unknown -- not_found is reconciled
+//      later, once, after all of a count's stages are in; see the note further down).
+//   5. Persist each result row into count_items immediately, tagged with this stage --
+//      this is what makes a stage durable the moment it's analyzed, independent of whether
+//      the browser tab survives to see the response.
 
 import { getSupabaseAdmin } from './_lib/supabase.js';
 
 const ANTHROPIC_API_URL = 'https://api.anthropic.com/v1/messages';
 const MODEL = 'claude-sonnet-5';
 const CONFIDENCE_THRESHOLD = 0.75; // matches the 0.75 default called out in the product spec
+const PHOTO_BUCKET = 'count-photos';
 
 export default async function handler(req, res) {
   if (req.method !== 'POST') {
@@ -29,22 +39,44 @@ export default async function handler(req, res) {
   }
 
   try {
-    const { areaId, images } = req.body || {};
+    const { areaId, countId, stageId, stageName, storagePaths } = req.body || {};
 
     if (!areaId || typeof areaId !== 'string') {
       res.status(400).json({ error: 'areaId is required' });
       return;
     }
-    if (!Array.isArray(images) || images.length === 0) {
-      res.status(400).json({ error: 'images must be a non-empty array' });
+    if (!countId || typeof countId !== 'string') {
+      res.status(400).json({ error: 'countId is required -- call /api/start-count first' });
       return;
     }
-    if (images.length > 5) {
-      res.status(400).json({ error: 'Max 5 images per stage' });
+    if (!stageId || typeof stageId !== 'string') {
+      res.status(400).json({ error: 'stageId is required' });
+      return;
+    }
+    if (!Array.isArray(storagePaths) || storagePaths.length === 0) {
+      res.status(400).json({ error: 'storagePaths must be a non-empty array' });
+      return;
+    }
+    if (storagePaths.length > 5) {
+      res.status(400).json({ error: 'Max 5 photos per stage' });
       return;
     }
 
     const supabase = getSupabaseAdmin();
+
+    // 0. Pull this stage's photos down from Storage. Fail the whole request if any is
+    //    missing -- an incomplete photo set shouldn't silently produce a partial count.
+    const imageBlocks = [];
+    for (const path of storagePaths) {
+      const { data: fileData, error: dlErr } = await supabase.storage.from(PHOTO_BUCKET).download(path);
+      if (dlErr) {
+        res.status(404).json({ error: `Failed to fetch photo "${path}" from storage`, details: dlErr.message });
+        return;
+      }
+      const buffer = Buffer.from(await fileData.arrayBuffer());
+      const mediaType = fileData.type || 'image/jpeg';
+      imageBlocks.push({ type: 'image', source: { type: 'base64', media_type: mediaType, data: buffer.toString('base64') } });
+    }
 
     // 1. Pull this area's assigned items (the area-scoped catalog).
     const { data: assignments, error: dbError } = await supabase
@@ -70,6 +102,7 @@ export default async function handler(req, res) {
       packSize: a.items.pack_size,
       parLevel: a.par_level,
       referenceImageUrl: a.items.reference_image_url,
+      aliases: Array.isArray(a.items.aliases) ? a.items.aliases : [],
     }));
 
     // 1b. Download reference photos (only for items that have one -- most won't).
@@ -108,7 +141,9 @@ For every item you can identify, report:
 
 If you see something on shelf that is clearly inventory but does NOT match any item on the list, include it in "unrecognizedItems" with a short description instead of an itemId.
 
-Work through the photos step by step first: note what shelf/area each photo covers, which items repeat across photos, and how many of each distinct item you can actually count. Use printed vendor codes, item numbers, or other label text to disambiguate near-identical packaging where possible. Then, once you've reasoned through it, end your response with a line containing only "FINAL ANSWER:" followed by valid JSON in this exact shape and nothing else after it:
+Each item in the list may include an "aliases" array -- these are alternate vendor codes, UPCs, or label text that operators have recorded for that item. Treat any of these as equally valid to the item's "name" when matching what's printed on a package.
+
+Work through the photos step by step first: note what shelf/area each photo covers, which items repeat across photos, and how many of each distinct item you can actually count. Use printed vendor codes, item numbers, UPCs, or other label text (including any aliases listed) to disambiguate near-identical packaging where possible. Then, once you've reasoned through it, end your response with a line containing only "FINAL ANSWER:" followed by valid JSON in this exact shape and nothing else after it:
 {
   "counts": [ { "itemId": "string", "count": number, "confidence": number } ],
   "unrecognizedItems": [ { "description": "string", "confidence": number } ]
@@ -117,16 +152,7 @@ Work through the photos step by step first: note what shelf/area each photo cove
 Item list for this area:
 ${JSON.stringify(promptItemList, null, 2)}`;
 
-    const imageBlocks = images.map((img) => ({
-      type: 'image',
-      source: {
-        type: 'base64',
-        media_type: img.mediaType,
-        data: img.data,
-      },
-    }));
-
-    // 3. Call Claude Vision.
+    // 3. Call Claude Vision (imageBlocks were built from Storage downloads above).
     const response = await fetch(ANTHROPIC_API_URL, {
       method: 'POST',
       headers: {
@@ -179,15 +205,20 @@ ${JSON.stringify(promptItemList, null, 2)}`;
     // 4. Map into the app's match-status model.
     //    - matched / visual_match: the AI matched a real item on this area's list, split by confidence.
     //    - unknown: something visible that is NOT on the area's list at all (a genuinely new item).
-    //    - not_found: an item that IS assigned to this area but wasn't seen in any photo.
+    //    This endpoint only reports what was actually seen in THIS stage's photos -- it does not
+    //    know the full set of stages a location will be counted across, so it never emits
+    //    not_found rows. Reconciling "assigned to the area but never seen in any stage" happens
+    //    once, client-side, after every stage's results have been merged (see mergeStageResults
+    //    in App.jsx). Doing it per-stage here was the root cause of the old cross-stage-conflict
+    //    bug: every item not visible in a given 5-photo stage was getting a not_found row, so
+    //    nearly every catalog item ended up with a row in every stage and got flagged as a
+    //    "conflict" purely from an artifact of how stages were batched, not a real double-count risk.
     const itemById = new Map(areaItems.map((i) => [i.itemId, i]));
-    const seenIds = new Set();
 
     const results = [];
     for (const c of (parsed.counts || [])) {
       const it = itemById.get(c.itemId);
       if (!it) continue; // model referenced an itemId not on the list -- ignore rather than guess
-      seenIds.add(c.itemId);
       results.push({
         itemId: c.itemId,
         name: it.name,
@@ -195,19 +226,6 @@ ${JSON.stringify(promptItemList, null, 2)}`;
         confidence: c.confidence,
         matchStatus: c.confidence >= CONFIDENCE_THRESHOLD ? 'matched' : 'visual_match',
       });
-    }
-
-    // Items assigned to the area but not detected at all -> flagged for manual review.
-    for (const item of areaItems) {
-      if (!seenIds.has(item.itemId)) {
-        results.push({
-          itemId: item.itemId,
-          name: item.name,
-          aiCount: 0,
-          confidence: 0,
-          matchStatus: 'not_found',
-        });
-      }
     }
 
     // Genuinely unrecognized items (visible, but not on this area's list) become
@@ -220,10 +238,41 @@ ${JSON.stringify(promptItemList, null, 2)}`;
       matchStatus: 'unknown',
     }));
 
+    const allResults = [...results, ...unrecognized];
+
+    // 5. Persist this stage's results now, before responding -- if the client never sees
+    //    this response (tab killed, connection dropped), the stage's work isn't lost.
+    //    (Deliberately no not_found rows here -- see the comment above; those are
+    //    reconciled once at finalize, across every stage this count actually ran.)
+    if (allResults.length > 0) {
+      const rows = allResults.map((r) => ({
+        count_id: countId,
+        item_id: r.itemId,
+        ai_count: r.aiCount,
+        confidence: r.confidence,
+        match_status: r.matchStatus,
+        stage_id: stageId,
+        stage_name: stageName || null,
+      }));
+      const { data: inserted, error: persistErr } = await supabase.from('count_items').insert(rows).select('id');
+      if (persistErr) {
+        // Analysis succeeded but persistence failed -- still return the results so the
+        // person isn't blocked, but flag it so the frontend knows this stage isn't durable
+        // yet and should retry the save rather than silently move on.
+        res.status(200).json({ areaId, countId, stageId, results: allResults, model: MODEL, persisted: false, persistError: persistErr.message });
+        return;
+      }
+      // Supabase returns inserted rows in the same order they were given.
+      inserted.forEach((row, i) => { allResults[i].dbId = row.id; });
+    }
+
     res.status(200).json({
       areaId,
-      results: [...results, ...unrecognized],
+      countId,
+      stageId,
+      results: allResults,
       model: MODEL,
+      persisted: true,
     });
   } catch (err) {
     res.status(500).json({ error: 'Unexpected server error', details: err.message });
