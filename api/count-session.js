@@ -7,20 +7,33 @@
 // deployment failed outright. One file, routed by `action`, keeps the same functionality
 // at a net cost of +1 function instead of +4.
 //
-// GET  /api/count-session?areaId=area_xxx
+// GET  /api/count-session?areaId=area_xxx&deviceId=dev_xxx
 //   -> resume: returns an in-progress count for this area (if any), with everything
 //      persisted for it so far, so the frontend can offer to pick up where it left off.
+//      If a DIFFERENT device already has this area's count in progress, returns
+//      { resumable: false, activeElsewhere: true, startedAt } instead of handing it over --
+//      see the multi-user collision note on handleStart below.
 //
-// POST /api/count-session   body: { action: "start", areaId }
-//   -> creates (or reuses) an in-progress `counts` row for this area.
+// POST /api/count-session   body: { action: "start", areaId, deviceId, force? }
+//   -> creates (or reuses) an in-progress `counts` row for this area. Two devices can no
+//      longer collide on the same session silently: if another device's session is already
+//      in progress here, this returns 409 { collision: true } unless force is set, in which
+//      case the other device's session is marked abandoned and a fresh one is started. This
+//      is a lightweight stand-in for real per-user ownership -- there's no auth system yet,
+//      so "device" is just a persisted browser-local id, not a verified identity.
 //
 // POST /api/count-session   body: { action: "upload-url", areaId, stageId, mediaType }
 //   -> returns a signed Storage upload URL/token for one photo. The browser uploads
 //      directly to Storage with it -- the photo bytes never pass through this function.
 //
-// POST /api/count-session   body: { action: "record-photos", countId, photos: [{storagePath, sha256}] }
+// POST /api/count-session   body: { action: "record-photos", countId, photos: [{storagePath, sha256, stageId}] }
 //   -> writes count_photos rows right after each photo finishes uploading, independent of
 //      whether AI analysis subsequently succeeds (the audit trail shouldn't depend on that).
+//      stageId is stored per-photo so the audit trail can tell which stage each photo
+//      belongs to (used by GET resume above to group photos correctly).
+//
+// POST /api/count-session   body: { action: "abandon", countId }
+//   -> marks an in-progress count abandoned so "Start Over" doesn't keep reusing it.
 
 import { getSupabaseAdmin } from './_lib/supabase.js';
 
@@ -33,7 +46,7 @@ function extFor(mediaType) {
 }
 
 async function handleResume(req, res, supabase) {
-  const { areaId } = req.query || {};
+  const { areaId, deviceId } = req.query || {};
   if (!areaId || typeof areaId !== 'string') {
     res.status(400).json({ error: 'areaId is required' });
     return;
@@ -41,7 +54,7 @@ async function handleResume(req, res, supabase) {
 
   const { data: count, error: countErr } = await supabase
     .from('counts')
-    .select('id, started_at')
+    .select('id, started_at, started_by')
     .eq('area_id', areaId)
     .eq('status', 'in_progress')
     .order('started_at', { ascending: false })
@@ -57,9 +70,18 @@ async function handleResume(req, res, supabase) {
     return;
   }
 
+  // Someone else's device already has this area's count in progress -- don't hand it to this
+  // device as "resumable" (that's the multi-user collision: two people's photos/results
+  // silently intermingling in the same session). Tell the frontend it's active elsewhere
+  // instead, so it can show that rather than an offer to continue.
+  if (count.started_by && deviceId && count.started_by !== deviceId) {
+    res.status(200).json({ resumable: false, activeElsewhere: true, startedAt: count.started_at });
+    return;
+  }
+
   const [{ data: items, error: itemsErr }, { data: photos, error: photosErr }] = await Promise.all([
     supabase.from('count_items').select('id, item_id, ai_count, confidence, match_status, stage_id, stage_name').eq('count_id', count.id),
-    supabase.from('count_photos').select('id, stage_id, storage_path, captured_at').eq('count_id', count.id),
+    supabase.from('count_photos').select('id, stage_id, storage_path, sha256_hash, captured_at').eq('count_id', count.id),
   ]);
 
   if (itemsErr || photosErr) {
@@ -80,7 +102,7 @@ async function handleResume(req, res, supabase) {
 }
 
 async function handleStart(req, res, supabase) {
-  const { areaId } = req.body || {};
+  const { areaId, deviceId, force } = req.body || {};
   if (!areaId || typeof areaId !== 'string') {
     res.status(400).json({ error: 'areaId is required' });
     return;
@@ -88,7 +110,7 @@ async function handleStart(req, res, supabase) {
 
   const { data: existing, error: findErr } = await supabase
     .from('counts')
-    .select('id')
+    .select('id, started_by, started_at')
     .eq('area_id', areaId)
     .eq('status', 'in_progress')
     .order('started_at', { ascending: false })
@@ -99,14 +121,45 @@ async function handleStart(req, res, supabase) {
     res.status(500).json({ error: 'Failed to check for an existing in-progress count', details: findErr.message });
     return;
   }
+
   if (existing) {
-    res.status(200).json({ countId: existing.id, resumed: true });
-    return;
+    const belongsToSomeoneElse = existing.started_by && deviceId && existing.started_by !== deviceId;
+
+    if (belongsToSomeoneElse && !force) {
+      // Two people counting the same area at once used to silently share one session. Now
+      // the second device is told explicitly and has to choose to take over, rather than its
+      // photos and AI results quietly getting mixed into the first device's count.
+      res.status(409).json({
+        error: 'Another device is already counting this area',
+        collision: true,
+        countId: existing.id,
+        startedAt: existing.started_at,
+      });
+      return;
+    }
+
+    if (belongsToSomeoneElse && force) {
+      // Explicit takeover: retire the other device's session (kept, not deleted -- audit
+      // trail) and start a fresh one rather than mutating a session that isn't ours.
+      const { error: abandonErr } = await supabase.from('counts').update({ status: 'abandoned' }).eq('id', existing.id);
+      if (abandonErr) {
+        res.status(500).json({ error: 'Failed to release the other device\'s count', details: abandonErr.message });
+        return;
+      }
+    } else {
+      // Same device resuming (or a pre-existing row from before started_by was tracked) --
+      // claim/confirm ownership and hand it back.
+      if (!existing.started_by && deviceId) {
+        await supabase.from('counts').update({ started_by: deviceId }).eq('id', existing.id);
+      }
+      res.status(200).json({ countId: existing.id, resumed: true });
+      return;
+    }
   }
 
   const { data: created, error: createErr } = await supabase
     .from('counts')
-    .insert({ area_id: areaId, status: 'in_progress' })
+    .insert({ area_id: areaId, status: 'in_progress', started_by: deviceId || null })
     .select('id')
     .single();
 
@@ -116,6 +169,32 @@ async function handleStart(req, res, supabase) {
   }
 
   res.status(200).json({ countId: created.id, resumed: false });
+}
+
+// POST /api/count-session   body: { action: "abandon", countId }
+//   -> marks an in-progress count session abandoned (never deleted -- keeps the audit
+//      trail intact) so "Start Over" doesn't keep writing into the same stale countId,
+//      and so a later visit to this area doesn't offer to "resume" it.
+async function handleAbandon(req, res, supabase) {
+  const { countId } = req.body || {};
+  if (!countId || typeof countId !== 'string') {
+    res.status(400).json({ error: 'countId is required' });
+    return;
+  }
+
+  const { data, error } = await supabase
+    .from('counts')
+    .update({ status: 'abandoned' })
+    .eq('id', countId)
+    .eq('status', 'in_progress')
+    .select('id');
+
+  if (error) {
+    res.status(500).json({ error: 'Failed to abandon count', details: error.message });
+    return;
+  }
+
+  res.status(200).json({ abandoned: (data || []).length > 0 });
 }
 
 async function handleUploadUrl(req, res, supabase) {
@@ -150,6 +229,7 @@ async function handleRecordPhotos(req, res, supabase) {
     count_id: countId,
     storage_path: p.storagePath,
     sha256_hash: p.sha256 || null,
+    stage_id: p.stageId || null,
   }));
 
   const { error } = await supabase.from('count_photos').insert(rows);
@@ -175,7 +255,8 @@ export default async function handler(req, res) {
       if (action === 'start') { await handleStart(req, res, supabase); return; }
       if (action === 'upload-url') { await handleUploadUrl(req, res, supabase); return; }
       if (action === 'record-photos') { await handleRecordPhotos(req, res, supabase); return; }
-      res.status(400).json({ error: 'Unknown or missing action. Expected one of: start, upload-url, record-photos' });
+      if (action === 'abandon') { await handleAbandon(req, res, supabase); return; }
+      res.status(400).json({ error: 'Unknown or missing action. Expected one of: start, upload-url, record-photos, abandon' });
       return;
     }
 

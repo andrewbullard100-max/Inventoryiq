@@ -39,6 +39,18 @@ const EASE = "cubic-bezier(0.22, 1, 0.36, 1)";
 
 const uid = (p = "id") => p + "-" + Math.random().toString(36).slice(2, 8);
 
+// A lightweight per-browser device identifier -- NOT a real user/auth system, just enough to
+// tell two concurrent devices/tabs apart so they don't silently collide on the same count
+// session (see startCountSession / handleStart). Persisted so the same browser is recognized
+// as "the same session owner" across reloads.
+function getDeviceId() {
+  try {
+    let id = localStorage.getItem("iiq_device_id");
+    if (!id) { id = (crypto.randomUUID ? crypto.randomUUID() : uid("dev")); localStorage.setItem("iiq_device_id", id); }
+    return id;
+  } catch { return uid("dev"); } // localStorage unavailable (private mode etc) -- degrade to a per-load id
+}
+
 // ─── Area suggestions per industry (all user-editable) ───────────────────────
 const AREA_SUGGESTIONS = {
   Foodservice: ["Walk-in Cooler","Freezer","Dry Storage","Bar & Spirits","Prep Kitchen","Dairy Reach-in","Produce Cooler","Chemical Storage"],
@@ -246,6 +258,31 @@ function adaptAnalysisResults(backendResults, areaItems) {
   });
 }
 
+// Adapts the raw count_items rows that /api/count-session's resume endpoint
+// returns (completedStageResults: { id, item_id, ai_count, confidence,
+// match_status, stage_id, stage_name }) into the SAME row shape
+// adaptAnalysisResults produces, so a resumed stage's results can be merged
+// into the final count sheet exactly like a freshly-analyzed stage's results.
+// Without this, resumed stages only ever informed the "✓ already analyzed"
+// banner -- they never actually flowed into allResults / finalResults, so an
+// item that existed only on an earlier (resumed) stage silently became
+// not_found once a later stage was analyzed and merged.
+function adaptResumedResults(rows, areaItems) {
+  const byId = new Map(areaItems.map(i => [i.id, i]));
+  return (rows || []).map(r => {
+    const it = byId.get(r.item_id);
+    return {
+      key: uid("ci"), itemId: r.item_id, dbId: r.id || null, sku: it?.sku || r.item_id, name: it?.name || "Unknown item",
+      size: it?.size || "", aiCount: Math.max(0, Math.round(r.ai_count || 0)),
+      par: it?.par ?? null, confidence: Math.min(1, Math.max(0, r.confidence || 0)),
+      unit: it?.unit || "units", price: it?.price || 0,
+      notes: "", matchStatus: r.match_status || "unknown",
+      override: null, confirmed: false,
+      stageId: r.stage_id || null, stageName: r.stage_name || null,
+    };
+  });
+}
+
 // ─── Storage-uploaded photo capture ──────────────────────────────────────────
 // Lazily-created browser Supabase client, used ONLY for uploading directly to
 // a signed Storage URL. It's initialized with the public anon key (safe to
@@ -272,19 +309,40 @@ async function sha256Hex(blob) {
 // All four of these hit /api/count-session (one file, routed by `action`) rather than
 // four separate endpoint files -- Vercel's Hobby plan caps a deployment at 12 Serverless
 // Functions, and four new files would have pushed this project over that limit outright.
-async function startCountSession(areaId) {
+async function startCountSession(areaId, { force = false } = {}) {
   const res = await fetch("/api/count-session", {
     method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ action: "start", areaId }),
+    body: JSON.stringify({ action: "start", areaId, deviceId: getDeviceId(), force }),
   });
-  if (!res.ok) { const b = await res.json().catch(() => ({})); throw new Error(b.error || "Could not start count session"); }
-  return res.json(); // { countId, resumed }
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    if (res.status === 409 && body.collision) {
+      const err = new Error(body.error || "Another device is already counting this area");
+      err.collision = { startedAt: body.startedAt, countId: body.countId };
+      throw err;
+    }
+    throw new Error(body.error || "Could not start this count session");
+  }
+  return body; // { countId, resumed }
 }
 
 async function resumeCount(areaId) {
-  const res = await fetch(`/api/count-session?areaId=${encodeURIComponent(areaId)}`);
+  const res = await fetch(`/api/count-session?areaId=${encodeURIComponent(areaId)}&deviceId=${encodeURIComponent(getDeviceId())}`);
   if (!res.ok) return { resumable: false };
-  return res.json(); // { resumable, countId, stageIds, completedStageResults, photos }
+  return res.json(); // { resumable, countId, stageIds, completedStageResults, photos } | { resumable: false, activeElsewhere, startedAt }
+}
+
+// "Start Over" needs to genuinely abandon the in-progress count session, not just clear the
+// photos client-side -- otherwise the next attempt silently keeps writing into the same old
+// countId (and would even get "resumed" back into it on next load). This marks the session
+// abandoned server-side rather than deleting it, so it's still there for audit purposes.
+async function abandonCount(countId) {
+  const res = await fetch("/api/count-session", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ action: "abandon", countId }),
+  });
+  if (!res.ok) { const b = await res.json().catch(() => ({})); throw new Error(b.error || "Could not abandon count session"); }
+  return res.json();
 }
 
 // Uploads one already-compressed photo directly to Supabase Storage via a
@@ -308,7 +366,7 @@ async function uploadPhotoToStorage({ areaId, stageId, countId, blob, mediaType 
 
   const recordRes = await fetch("/api/count-session", {
     method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ action: "record-photos", countId, photos: [{ storagePath: path, sha256 }] }),
+    body: JSON.stringify({ action: "record-photos", countId, photos: [{ storagePath: path, sha256, stageId }] }),
   });
   if (!recordRes.ok) { const b = await recordRes.json().catch(() => ({})); throw new Error(b.error || "Photo uploaded but failed to record"); }
 
@@ -1222,6 +1280,9 @@ const CaptureScreen = ({ locations, items, assignments, stages, setStages, setti
   const [countId, setCountId] = useState(null);
   const [completedStageIds, setCompletedStageIds] = useState(new Set());
   const [resumeBanner, setResumeBanner] = useState(null); // { countId, stageCount } | null
+  const [resumedResults, setResumedResults] = useState([]); // previously-persisted rows from a resumed count, adapted to row shape
+  const [activeElsewhere, setActiveElsewhere] = useState(null); // { startedAt } | null -- another device is already counting this area
+  const [collision, setCollision] = useState(null); // { startedAt, countId } | null -- surfaced when THIS device tries to start and loses the race
   const uploadPromisesRef = useRef({}); // imgId -> Promise<storagePath>
 
   const loc = locations.find(l => l.id === locId) || locations[0];
@@ -1244,7 +1305,7 @@ const CaptureScreen = ({ locations, items, assignments, stages, setStages, setti
   // Also check for an in-progress count left over from a dropped connection / closed tab, so a
   // several-hundred-photo count doesn't have to restart from zero after an interruption.
   useEffect(() => {
-    setCountId(null); setCompletedStageIds(new Set()); setResumeBanner(null); uploadPromisesRef.current = {};
+    setCountId(null); setCompletedStageIds(new Set()); setResumeBanner(null); setResumedResults([]); setActiveElsewhere(null); setCollision(null); uploadPromisesRef.current = {};
     if (!area) { setStageList([]); return; }
     const persisted = stages.filter(s => s.areaId === area.id).sort((a, b) => a.sortOrder - b.sortOrder);
     setStageList(persisted.length > 0
@@ -1253,10 +1314,15 @@ const CaptureScreen = ({ locations, items, assignments, stages, setStages, setti
 
     let cancelled = false;
     resumeCount(area.id).then(r => {
-      if (cancelled || !r.resumable) return;
+      if (cancelled) return;
+      if (r.activeElsewhere) { setActiveElsewhere({ startedAt: r.startedAt }); return; }
+      if (!r.resumable) return;
       const stageIdsWithResults = new Set((r.completedStageResults || []).map(i => i.stage_id));
       setCountId(r.countId);
       setCompletedStageIds(stageIdsWithResults);
+      // Adapt the previously-persisted rows into the row shape doProcess merges with, so
+      // completing the remaining stages doesn't lose whatever earlier stages already found.
+      setResumedResults(adaptResumedResults(r.completedStageResults || [], areaItems));
       if (stageIdsWithResults.size > 0) setResumeBanner({ countId: r.countId, stageCount: stageIdsWithResults.size });
     }).catch(() => {});
     return () => { cancelled = true; };
@@ -1288,7 +1354,10 @@ const CaptureScreen = ({ locations, items, assignments, stages, setStages, setti
     let cid = countId;
     if (!cid) {
       try { const started = await startCountSession(area.id); cid = started.countId; setCountId(cid); }
-      catch (e) { setErrorMsg(e.message || "Could not start this count session."); return; }
+      catch (e) {
+        if (e.collision) { setCollision(e.collision); return; } // surfaced via the banner below, not a generic error
+        setErrorMsg(e.message || "Could not start this count session."); return;
+      }
     }
 
     for (const file of valid) {
@@ -1347,16 +1416,31 @@ const CaptureScreen = ({ locations, items, assignments, stages, setStages, setti
 
     try {
       let cid = countId;
-      if (!cid) { const started = await startCountSession(area.id); cid = started.countId; setCountId(cid); }
+      if (!cid) {
+        try { const started = await startCountSession(area.id); cid = started.countId; setCountId(cid); }
+        catch (e) { if (e.collision) { setCollision(e.collision); setPhase("ready"); setProgress(0); return; } throw e; }
+      }
 
       // Every photo's upload was kicked off the moment it was captured -- make sure they've
       // actually landed in Storage (and been recorded) before we try to analyze them.
+      // Important: `activeStages` is a snapshot of state taken above, before this await. A
+      // photo still mid-upload at that moment has storagePath: null in that snapshot, and
+      // React updating state once the upload finishes doesn't retroactively update this
+      // already-captured array. So collect the final paths from what the upload promises
+      // themselves resolve to -- not by re-reading the stale snapshot -- and analyze from
+      // those; otherwise tapping Analyze while uploads are still running can silently skip
+      // a stage's photos.
       setStageProgressLabel("Finishing photo uploads…");
-      await Promise.all(activeStages.flatMap(s => s.images.map(img => uploadPromisesRef.current[img.id]).filter(Boolean)));
+      const resolvedPaths = {}; // imgId -> storagePath, filled in as each upload promise settles
+      await Promise.all(activeStages.flatMap(s => s.images.map(img => {
+        const p = uploadPromisesRef.current[img.id];
+        if (!p) return null;
+        return p.then(path => { resolvedPaths[img.id] = path; });
+      })).filter(Boolean));
 
       let completed = 0;
       const stageResultsList = await runWithConcurrency(activeStages, 3, async (s) => {
-        const storagePaths = s.images.map(img => img.storagePath).filter(Boolean);
+        const storagePaths = s.images.map(img => resolvedPaths[img.id] || img.storagePath).filter(Boolean);
         if (storagePaths.length === 0) return [];
         const backendResults = await analysePhotosViaBackend({ storagePaths, areaId: area.id, countId: cid, stageId: s.id, stageName: s.name });
         completed++;
@@ -1366,7 +1450,13 @@ const CaptureScreen = ({ locations, items, assignments, stages, setStages, setti
         adapted.forEach(r => { r.stageId = s.id; r.stageName = s.name; });
         return adapted;
       });
-      const allResults = stageResultsList.flat();
+      // Carry forward results from stages that were already analyzed in a previous browser
+      // session (resumed) but aren't being redone right now -- if a stage IS in activeStages
+      // (the person added new photos to it), its freshly-analyzed rows below supersede the
+      // old ones instead of stacking with them.
+      const activeStageIds = new Set(activeStages.map(s => s.id));
+      const carriedOverResults = resumedResults.filter(r => !activeStageIds.has(r.stageId));
+      const allResults = [...carriedOverResults, ...stageResultsList.flat()];
       setProgress(95);
 
       // Merge across stages: an item seen in only one stage counts normally. An item seen in
@@ -1478,6 +1568,23 @@ const CaptureScreen = ({ locations, items, assignments, stages, setStages, setti
               </p>
             </div>
           )}
+          {(activeElsewhere || collision) && (
+            <div style={{ padding: "12px 14px", background: C.amberBg, border: `1px solid ${C.amberBorder}`, borderRadius: 10 }}>
+              <p style={{ margin: "0 0 8px", fontSize: 12, color: C.amber, fontWeight: 700 }}>
+                ⚠ Someone else is already counting {area?.name}{(activeElsewhere?.startedAt || collision?.startedAt) ? ` — started ${new Date(activeElsewhere?.startedAt || collision?.startedAt).toLocaleTimeString()}` : ""}
+              </p>
+              <p style={{ margin: "0 0 10px", fontSize: 11, color: C.textSub }}>
+                Capturing here now would mix your photos into their in-progress count. Wait for them to finish, or take over if you're sure they're not still counting (this marks their session abandoned — their work stays saved for audit, but they'll need to restart if they come back).
+              </p>
+              <button onClick={async () => {
+                try {
+                  const started = await startCountSession(area.id, { force: true });
+                  setCountId(started.countId);
+                  setCollision(null); setActiveElsewhere(null); setResumeBanner(null); setResumedResults([]); setCompletedStageIds(new Set());
+                } catch (e) { setErrorMsg(e.message || "Could not take over this count."); }
+              }} style={{ background: C.amber, border: "none", color: "#fff", borderRadius: 8, padding: "8px 14px", fontWeight: 700, fontSize: 12, cursor: "pointer" }}>Take Over Anyway</button>
+            </div>
+          )}
         </div>
       )}
 
@@ -1580,7 +1687,14 @@ const CaptureScreen = ({ locations, items, assignments, stages, setStages, setti
 
       {(phase === "done" || phase === "error") && (
         <div style={{ display: "flex", gap: 10 }}>
-          <button onClick={() => { setStageList(prev => prev.map(s => ({ ...s, images: [] }))); setPhase("ready"); setProgress(0); }} style={{ flex: 1, background: C.card, border: `1px solid ${C.borderDark}`, color: C.textSub, borderRadius: 12, padding: 16, fontWeight: 700, fontSize: 14, cursor: "pointer" }}>Start Over</button>
+          <button onClick={async () => {
+            const cid = countId;
+            setStageList(prev => prev.map(s => ({ ...s, images: [] })));
+            setPhase("ready"); setProgress(0);
+            setCountId(null); setCompletedStageIds(new Set()); setResumeBanner(null); setResumedResults([]);
+            uploadPromisesRef.current = {};
+            if (cid) { try { await abandonCount(cid); } catch { /* best-effort -- stale session just won't be resumable, not fatal */ } }
+          }} style={{ flex: 1, background: C.card, border: `1px solid ${C.borderDark}`, color: C.textSub, borderRadius: 12, padding: 16, fontWeight: 700, fontSize: 14, cursor: "pointer" }}>Start Over</button>
           {phase === "done" && <GoldBtn onClick={() => navigate("review")} style={{ flex: 2 }}>Review Count Sheet →</GoldBtn>}
           {phase === "error" && <PrimaryBtn onClick={doProcess} style={{ flex: 2 }}>Retry</PrimaryBtn>}
         </div>

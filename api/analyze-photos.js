@@ -244,6 +244,19 @@ ${JSON.stringify(promptItemList, null, 2)}`;
     //    this response (tab killed, connection dropped), the stage's work isn't lost.
     //    (Deliberately no not_found rows here -- see the comment above; those are
     //    reconciled once at finalize, across every stage this count actually ran.)
+    //
+    //    Idempotency: this stage may be getting re-analyzed on a retry -- either because a
+    //    prior attempt persisted successfully but the client never saw the response before
+    //    retrying, or because it was part of a concurrent batch where a sibling stage failed
+    //    and the whole batch got retried. Either way, count_id + stage_id rows from any
+    //    earlier attempt need to be cleared before inserting the fresh set, or a retry
+    //    duplicates that stage's line items instead of replacing them.
+    const { error: clearErr } = await supabase.from('count_items').delete().eq('count_id', countId).eq('stage_id', stageId);
+    if (clearErr) {
+      res.status(500).json({ error: 'Failed to clear previous results for this stage before re-inserting', details: clearErr.message });
+      return;
+    }
+
     if (allResults.length > 0) {
       const rows = allResults.map((r) => ({
         count_id: countId,
