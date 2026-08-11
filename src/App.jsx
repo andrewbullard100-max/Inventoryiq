@@ -437,6 +437,7 @@ async function loadCatalog() {
     unit: i.order_uom || "units", vendor: i.vendor || "", price: i.unit_price || 0,
     aliases: Array.isArray(i.aliases) ? i.aliases.join(",") : "",
     referenceImageUrl: i.reference_image_url || null,
+    referenceImages: Array.isArray(i.reference_image_urls) ? i.reference_image_urls : [],
   }));
 
   const areaToLocation = {};
@@ -479,17 +480,68 @@ async function removeStageFromBackend(stageId) {
 }
 
 // ─── Backend proxy: reference photos for hard-to-identify items ─────────────
-async function saveReferenceImage(itemId, mediaType, data) {
+// An item can hold several labeled angles (front/side/label/other) instead of a single
+// photo -- useful for SKUs that are hard to tell apart by front label alone. Returns the
+// item's full updated image list so the caller doesn't need a second round-trip.
+async function saveReferenceImage(itemId, mediaType, data, label = "other") {
   const res = await apiFetch("/api/upload-reference-image", {
     method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ itemId, mediaType, data }),
+    body: JSON.stringify({ itemId, mediaType, data, label }),
   });
   if (!res.ok) {
     const body = await res.json().catch(() => ({}));
     throw new Error(body.error || `Uploading reference photo failed (${res.status})`);
   }
-  return res.json(); // { url }
+  return res.json(); // { url, images: [{url,label,uploadedAt}] }
 }
+
+async function deleteReferenceImage(itemId, url) {
+  const res = await apiFetch("/api/upload-reference-image", {
+    method: "DELETE", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ itemId, url }),
+  });
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error(body.error || `Removing reference photo failed (${res.status})`);
+  }
+  return res.json(); // { images }
+}
+
+const REFERENCE_LABELS = [["front", "Front"], ["side", "Side"], ["label", "Label Close-up"], ["other", "Other"]];
+
+const ReferenceGallery = ({ item, uploading, onUpload, onRemove, compact = false }) => {
+  const fileRef = useRef(null);
+  const [pendingLabel, setPendingLabel] = useState("front");
+  const images = item.referenceImages || [];
+
+  return (
+    <div>
+      {images.length > 0 && (
+        <div style={{ display: "flex", gap: 8, overflowX: "auto", paddingBottom: 4, marginBottom: 10 }}>
+          {images.map(img => (
+            <div key={img.url} style={{ position: "relative", flexShrink: 0 }}>
+              <img src={img.url} alt="" style={{ width: 64, height: 64, borderRadius: 10, objectFit: "cover", border: `1px solid ${C.border}`, display: "block" }} />
+              <span style={{ position: "absolute", bottom: 2, left: 2, right: 2, background: "#0d1b2acc", color: "#fff", fontSize: 8, fontWeight: 700, textTransform: "uppercase", borderRadius: 5, textAlign: "center", padding: "1px 0" }}>{REFERENCE_LABELS.find(([k]) => k === img.label)?.[1] || "Other"}</span>
+              <button onClick={() => onRemove(img.url)} style={{ position: "absolute", top: -6, right: -6, width: 18, height: 18, borderRadius: "50%", background: C.red, border: "2px solid #fff", display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer" }}><Icon name="close" size={8} color="#fff" /></button>
+            </div>
+          ))}
+        </div>
+      )}
+      <input ref={fileRef} type="file" accept="image/*" style={{ display: "none" }} onChange={e => { const f = e.target.files[0]; if (f) onUpload(f, pendingLabel); e.target.value = ""; }} />
+      {!compact && (
+        <div style={{ display: "flex", gap: 4, marginBottom: 8 }}>
+          {REFERENCE_LABELS.map(([k, label]) => (
+            <button key={k} onClick={() => setPendingLabel(k)} style={{ flex: 1, background: pendingLabel === k ? C.navy : C.cardAlt, border: `1px solid ${pendingLabel === k ? C.navy : C.border}`, color: pendingLabel === k ? "#fff" : C.textSub, borderRadius: 7, padding: "6px 2px", fontSize: 10, fontWeight: 700, cursor: "pointer" }}>{label}</button>
+          ))}
+        </div>
+      )}
+      <button onClick={() => fileRef.current?.click()} disabled={uploading} style={{ width: "100%", background: C.goldDim, border: `1px solid ${C.goldBorder}`, color: C.navy, borderRadius: 8, padding: 9, fontSize: 12, fontWeight: 700, cursor: uploading ? "default" : "pointer", display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }}>
+        <Icon name="camera" size={13} color={C.gold} />{uploading ? "Uploading…" : images.length ? `Add ${compact ? "Photo" : REFERENCE_LABELS.find(([k]) => k === pendingLabel)?.[1]}` : "Add Reference Photo"}
+      </button>
+      {images.length === 0 && !compact && <p style={{ margin: "6px 0 0", fontSize: 10, color: C.textMuted, lineHeight: 1.5 }}>A front shot is usually enough. Add a side or label close-up too for items with similar packaging.</p>}
+    </div>
+  );
+};
 
 async function fetchFlaggedItems() {
   const res = await apiFetch("/api/flagged-items");
@@ -1126,7 +1178,6 @@ const CatalogScreen = ({ items, setItems, assignments, setAssignments, locations
   const [flagged, setFlagged] = useState([]);
   const [flaggedLoading, setFlaggedLoading] = useState(false);
   const [flaggedError, setFlaggedError] = useState("");
-  const refFileRef = useRef(null);
   const [uploadingFor, setUploadingFor] = useState(null);
 
   const loadFlagged = () => {
@@ -1139,15 +1190,15 @@ const CatalogScreen = ({ items, setItems, assignments, setAssignments, locations
 
   useEffect(() => { if (tab === "flagged") loadFlagged(); }, [tab]);
 
-  const attachReferencePhoto = (itemId, file) => {
+  const attachReferencePhoto = (itemId, file, label = "other") => {
     const reader = new FileReader();
     reader.onload = async (e) => {
       const [header, data] = e.target.result.split(",");
       const mediaType = header.match(/data:(.*);base64/)?.[1] || "image/jpeg";
       setUploadingFor(itemId);
       try {
-        const { url } = await saveReferenceImage(itemId, mediaType, data);
-        setItems(prev => prev.map(i => i.id === itemId ? { ...i, referenceImageUrl: url } : i));
+        const { url, images } = await saveReferenceImage(itemId, mediaType, data, label);
+        setItems(prev => prev.map(i => i.id === itemId ? { ...i, referenceImageUrl: url, referenceImages: images || i.referenceImages } : i));
         setFlagged(prev => prev.filter(f => f.itemId !== itemId));
       } catch (err) {
         setFlaggedError(err.message || "Upload failed");
@@ -1156,6 +1207,16 @@ const CatalogScreen = ({ items, setItems, assignments, setAssignments, locations
       }
     };
     reader.readAsDataURL(file);
+  };
+
+  const removeReferencePhoto = async (itemId, url) => {
+    setItems(prev => prev.map(i => i.id === itemId ? { ...i, referenceImages: (i.referenceImages || []).filter(img => img.url !== url) } : i));
+    try {
+      const { images } = await deleteReferenceImage(itemId, url);
+      setItems(prev => prev.map(i => i.id === itemId ? { ...i, referenceImages: images, referenceImageUrl: images.length ? images[images.length - 1].url : null } : i));
+    } catch (err) {
+      setSaveError(err.message || "Failed to remove reference photo");
+    }
   };
 
   const saveItem = async () => {
@@ -1334,9 +1395,6 @@ const CatalogScreen = ({ items, setItems, assignments, setAssignments, locations
 
       {tab === "flagged" && (
         <div>
-          <input ref={refFileRef} type="file" accept="image/*" style={{ display: "none" }}
-            onChange={e => { const f = e.target.files[0]; if (f && refFileRef.current.dataset.forItem) attachReferencePhoto(refFileRef.current.dataset.forItem, f); e.target.value = ""; }} />
-
           <div style={{ padding: "12px 14px", background: C.blueBg, border: `1px solid ${C.blue}44`, borderRadius: 12, marginBottom: 14 }}>
             <p style={{ margin: 0, fontSize: 12, color: C.blue, fontWeight: 600, lineHeight: 1.5 }}>
               These items have come back low-confidence in real counts at least twice. Attaching one clear reference photo per item gives Claude Vision something to visually compare against next time — most items never need this.
@@ -1360,23 +1418,20 @@ const CatalogScreen = ({ items, setItems, assignments, setAssignments, locations
             </div>
           ) : (
             <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-              {flagged.map(f => (
-                <div key={f.itemId} style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 12, padding: "12px 14px", display: "flex", alignItems: "center", gap: 12, boxShadow: "0 1px 3px rgba(13,27,42,0.05)" }}>
-                  <div style={{ flex: 1, minWidth: 0 }}>
+              {flagged.map(f => {
+                const fullItem = items.find(i => i.id === f.itemId) || { id: f.itemId, referenceImages: [] };
+                return (
+                  <div key={f.itemId} style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 12, padding: "12px 14px", boxShadow: "0 1px 3px rgba(13,27,42,0.05)" }}>
                     <p style={{ margin: 0, fontSize: 13, fontWeight: 700, color: C.navy }}>{f.name}</p>
-                    <p style={{ margin: "2px 0 0", fontSize: 11, color: C.textMuted }}>{f.brand || "No brand"} · flagged {f.occurrences}× in recent counts</p>
+                    <p style={{ margin: "2px 0 6px", fontSize: 11, color: C.textMuted }}>{f.brand || "No brand"} · flagged {f.occurrences}× in recent counts</p>
+                    {isManager && (
+                      <ReferenceGallery item={fullItem} uploading={uploadingFor === f.itemId} compact
+                        onUpload={(file, label) => attachReferencePhoto(f.itemId, file, label)}
+                        onRemove={(url) => removeReferencePhoto(f.itemId, url)} />
+                    )}
                   </div>
-                  {isManager && (
-                    <button
-                      onClick={() => { refFileRef.current.dataset.forItem = f.itemId; refFileRef.current.click(); }}
-                      disabled={uploadingFor === f.itemId}
-                      style={{ background: C.goldDim, border: `1px solid ${C.goldBorder}`, color: C.navy, borderRadius: 8, padding: "8px 12px", fontSize: 12, fontWeight: 700, cursor: "pointer", display: "flex", alignItems: "center", gap: 6, flexShrink: 0 }}>
-                      <Icon name="camera" size={14} color={C.gold} />
-                      {uploadingFor === f.itemId ? "Uploading…" : "Add Photo"}
-                    </button>
-                  )}
-                </div>
-              ))}
+                );
+              })}
             </div>
           )}
         </div>

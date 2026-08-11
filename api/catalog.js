@@ -25,7 +25,7 @@ export default async function handler(req, res) {
            { data: stages, error: stageErr }] = await Promise.all([
       supabase.from('locations').select('id, name').eq('organization_id', orgId),
       supabase.from('areas').select('id, location_id, name').eq('organization_id', orgId),
-      supabase.from('items').select('id, name, brand, vendor, vendor_item_code, order_uom, pack_size, unit_price, category_id, gl_account, aliases, reference_image_url').eq('organization_id', orgId),
+      supabase.from('items').select('id, name, brand, vendor, vendor_item_code, order_uom, pack_size, unit_price, category_id, gl_account, aliases, reference_image_url, reference_image_urls').eq('organization_id', orgId),
       supabase.from('item_area_assignments').select('id, item_id, area_id, par_level, sort_order').eq('organization_id', orgId),
       supabase.from('stages').select('id, area_id, name, sort_order').eq('organization_id', orgId).order('sort_order', { ascending: true }),
     ]);
