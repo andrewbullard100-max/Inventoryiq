@@ -530,6 +530,8 @@ async function finalizeCountToBackend(countId, areaId, requireApproval, items) {
         itemId: i.itemId || null,
         aiCount: i.aiCount, confidence: i.confidence, matchStatus: i.matchStatus,
         override: i.override, note: i.notes || "",
+        overrideReason: i.overrideReason || null, overrideNote: i.overrideNote || i.notes || "",
+        countStatus: i.countStatus || (i.matchStatus === "not_found" ? "not_seen" : "counted"),
         sourceRowIds: i.sourceRowIds || [],
       })),
     }),
@@ -540,6 +542,88 @@ async function finalizeCountToBackend(countId, areaId, requireApproval, items) {
   }
   return res.json(); // { countId, status, itemCount }
 }
+
+// ─── Backend proxy: approve / reject a submitted count ───────────────────────
+// actorName is no longer client-supplied -- the backend derives who did this from the
+// caller's verified auth token, which apiFetch already attaches.
+async function decideCount(action, countId, note) {
+  const res = await apiFetch("/api/finalize-count", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ action, countId, note }),
+  });
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error(body.error || `Could not ${action} this count (${res.status})`);
+  }
+  return res.json(); // { countId, status }
+}
+
+// ─── Backend proxy: operation-wide inventory value history, variance, approvals ─────
+async function fetchInventoryMetrics() {
+  const res = await apiFetch("/api/inventory-metrics");
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error(body.error || `Inventory metrics failed (${res.status})`);
+  }
+  return res.json();
+}
+
+const VARIANCE_TAGS = [
+  ["theft", "Theft"], ["waste", "Waste"], ["recipe_variance", "Recipe Variance"],
+  ["receiving_error", "Receiving Error"], ["counting_error", "Counting Error"], ["other", "Other"],
+];
+
+// Why an AI count needed correction -- captured at override time and later aggregated
+// into which items need a reference photo and which areas' review thresholds should be
+// more conservative. Deliberately short: a manager mid-review won't fill out a form.
+const OVERRIDE_REASONS = [
+  ["wrong_item", "Wrong Item"], ["wrong_quantity", "Wrong Quantity"],
+  ["partial_case", "Partial Case"], ["lighting_angle", "Lighting/Angle"], ["other", "Other"],
+];
+
+// Assigns (or clears with tag=null) a root-cause tag on a specific count line -- the only
+// write this endpoint does; everything else is read-only.
+async function tagVariance(countItemId, tag, note) {
+  const res = await apiFetch("/api/inventory-metrics", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ action: "tagVariance", countItemId, tag, note }),
+  });
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error(body.error || `Tagging variance failed (${res.status})`);
+  }
+  return res.json();
+}
+
+const money = (n) => new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", maximumFractionDigits: 0 }).format(Number(n || 0));
+
+const InventoryTrend = ({ snapshots }) => {
+  const pts = [...(snapshots || [])].reverse();
+  if (pts.length < 2) return <div style={{ fontSize: 12, color: C.textMuted, padding: "18px 0 4px" }}>Complete at least two inventory cycles to build a dollar trend.</div>;
+  const vals = pts.map(p => Number(p.value || 0));
+  const min = Math.min(...vals), max = Math.max(...vals);
+  const span = Math.max(1, max - min);
+  const width = 320, height = 88, pad = 8;
+  const coords = vals.map((v, i) => ({
+    x: pad + i * ((width - pad * 2) / Math.max(1, vals.length - 1)),
+    y: height - pad - ((v - min) / span) * (height - pad * 2),
+  }));
+  const points = coords.map(p => `${p.x},${p.y}`).join(" ");
+  return (
+    <div>
+      <svg viewBox={`0 0 ${width} ${height}`} width="100%" height="96" preserveAspectRatio="none" aria-label="Inventory dollar trend">
+        <polyline points={points} fill="none" stroke={C.gold} strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" />
+        {coords.map((p, i) => <circle key={i} cx={p.x} cy={p.y} r="4" fill={C.navy} stroke={C.gold} strokeWidth="2" />)}
+      </svg>
+      <div style={{ display: "flex", justifyContent: "space-between", gap: 8, marginTop: -4 }}>
+        {pts.map((p, i) => <div key={i} style={{ textAlign: i === 0 ? "left" : i === pts.length - 1 ? "right" : "center", flex: 1 }}>
+          <div style={{ fontSize: 10, color: C.textMuted }}>{new Date(p.date).toLocaleDateString(undefined, { month: "short", day: "numeric" })}</div>
+          <div style={{ fontSize: 10, fontWeight: 700, color: C.navy }}>{money(p.value)}</div>
+        </div>)}
+      </div>
+    </div>
+  );
+};
 
 // ─── Backend proxy: last finalized count for an area (starting reference) ────
 async function fetchLastCount(areaId) {
@@ -580,18 +664,43 @@ async function updateMemberRole(userId, role) { return orgAction("update-role", 
 async function removeMember(userId) { return orgAction("remove-member", { userId }); }
 
 // ─── SCREEN: Dashboard ────────────────────────────────────────────────────────
-const Dashboard = ({ locations, items, assignments, navigate }) => {
-  const areaCount = locations.reduce((s, l) => s + l.areas.length, 0);
+const Dashboard = ({ locations, items, assignments, navigate, isOnline, queuePending = 0, readyForReview = [], onOpenReady, settings, setSettings }) => {
+  const areaCount = locations.reduce((sum, l) => sum + l.areas.length, 0);
+  const [metrics, setMetrics] = useState(null);
+  const [metricsError, setMetricsError] = useState("");
+  const [rawMaterial30, setRawMaterial30] = useState(() => {
+    try { return localStorage.getItem("inventoryiq_raw_material_30d") || ""; } catch { return ""; }
+  });
+  const [categoryUsage30, setCategoryUsage30] = useState(() => {
+    try { return JSON.parse(localStorage.getItem("inventoryiq_category_usage_30d") || "{}"); } catch { return {}; }
+  });
+
+  useEffect(() => {
+    fetchInventoryMetrics().then(setMetrics).catch(e => setMetricsError(e.message || "Could not load inventory value history"));
+  }, []);
+
+  const saveRawMaterial = (value) => {
+    setRawMaterial30(value);
+    try { localStorage.setItem("inventoryiq_raw_material_30d", value); } catch {}
+  };
+  const saveCategoryUsage = (key, value) => {
+    const next = { ...categoryUsage30, [key]: value };
+    setCategoryUsage30(next);
+    try { localStorage.setItem("inventoryiq_category_usage_30d", JSON.stringify(next)); } catch {}
+  };
+
+  const usage30 = Number(rawMaterial30 || 0);
+  const dailyUsage = usage30 > 0 ? usage30 / 30 : 0;
+  const daysOnHand = dailyUsage > 0 ? (metrics?.currentValue || 0) / dailyUsage : null;
+  const variancePositive = (metrics?.variance || 0) >= 0;
+
   return (
     <div style={{ paddingBottom: 20 }}>
-      {/* Brand header */}
       <div style={{ padding: "28px 20px 22px", background: C.navy }}>
         <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
           <BrandMark size={38} />
           <div>
-            <h1 style={{ margin: 0, fontSize: 24, fontWeight: 400, color: "#fff", fontFamily: "'DM Serif Display', serif", letterSpacing: "-0.01em" }}>
-              Inventory<span style={{ color: C.gold }}>IQ</span>
-            </h1>
+            <h1 style={{ margin: 0, fontSize: 24, fontWeight: 400, color: "#fff", fontFamily: "'DM Serif Display', serif", letterSpacing: "-0.01em" }}>Inventory<span style={{ color: C.gold }}>IQ</span></h1>
             <p style={{ margin: "1px 0 0", fontSize: 11, color: C.goldLight, letterSpacing: "0.06em" }}>Visual counts. Smarter inventory.</p>
           </div>
         </div>
@@ -599,27 +708,243 @@ const Dashboard = ({ locations, items, assignments, navigate }) => {
           <Icon name="ai" size={15} color={C.gold} />
           <span style={{ fontSize: 12, color: "#fff", fontWeight: 600 }}>Claude Vision ready — photograph any area to count</span>
         </div>
+
+        {isOnline === false && (
+          <div style={{ marginTop: 10, padding: "10px 14px", background: "#ffffff12", border: `1px solid #ffffff33`, borderRadius: 10, display: "flex", alignItems: "center", gap: 10 }}>
+            <span style={{ width: 8, height: 8, borderRadius: "50%", background: C.gold, flexShrink: 0 }} />
+            <span style={{ fontSize: 12, color: "#fff", fontWeight: 600 }}>Offline{queuePending > 0 ? ` — ${queuePending} count${queuePending !== 1 ? "s" : ""} queued, will sync automatically` : ""}</span>
+          </div>
+        )}
       </div>
 
-      {/* Stats */}
-      <div style={{ padding: "18px 16px 8px", display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+      {(queuePending > 0 || readyForReview.length > 0 || (metrics?.pendingApprovals?.length || 0) > 0) && (
+        <div style={{ padding: "18px 16px 0" }}>
+          {queuePending > 0 && (
+            <div style={{ background: C.blueBg, border: `1px solid ${C.blue}33`, borderRadius: 14, padding: 14, display: "flex", alignItems: "center", gap: 12, marginBottom: 10 }}>
+              <div style={{ width: 36, height: 36, borderRadius: 10, background: "#fff", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}><Icon name="upload" size={17} color={C.blue} /></div>
+              <div>
+                <p style={{ margin: 0, fontSize: 12.5, fontWeight: 800, color: C.navy }}>{queuePending} count{queuePending !== 1 ? "s" : ""} waiting to sync</p>
+                <p style={{ margin: "1px 0 0", fontSize: 11, color: C.textSub }}>Saved on this device — will analyse automatically once you're back online.</p>
+              </div>
+            </div>
+          )}
+          {(metrics?.pendingApprovals?.length || 0) > 0 && (
+            <div onClick={() => navigate("approvals")} style={{ background: C.amberBg, border: `1px solid ${C.amberBorder}`, borderRadius: 14, padding: 14, display: "flex", alignItems: "center", gap: 12, marginBottom: 10, cursor: "pointer" }}>
+              <div style={{ width: 36, height: 36, borderRadius: 10, background: "#fff", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}><Icon name="shield" size={17} color={C.amber} /></div>
+              <div style={{ flex: 1 }}>
+                <p style={{ margin: 0, fontSize: 12.5, fontWeight: 800, color: C.navy }}>{metrics.pendingApprovals.length} count{metrics.pendingApprovals.length !== 1 ? "s" : ""} awaiting approval</p>
+                <p style={{ margin: "1px 0 0", fontSize: 11, color: C.textSub }}>Submitted and waiting on a manager sign-off.</p>
+              </div>
+              <Icon name="arrow" size={16} color={C.amber} />
+            </div>
+          )}
+          {readyForReview.map(entry => (
+            <div key={entry.id} onClick={() => onOpenReady?.(entry)} style={{ background: C.greenBg, border: `1px solid ${C.greenBorder}`, borderRadius: 14, padding: 14, display: "flex", alignItems: "center", gap: 12, marginBottom: 10, cursor: "pointer" }}>
+              <div style={{ width: 36, height: 36, borderRadius: 10, background: "#fff", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}><Icon name="check" size={17} color={C.green} /></div>
+              <div style={{ flex: 1 }}>
+                <p style={{ margin: 0, fontSize: 12.5, fontWeight: 800, color: C.navy }}>{entry.meta.area} — ready for review</p>
+                <p style={{ margin: "1px 0 0", fontSize: 11, color: C.textSub }}>Synced automatically · {entry.results.length} item{entry.results.length !== 1 ? "s" : ""} counted</p>
+              </div>
+              <Icon name="arrow" size={16} color={C.green} />
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Financial inventory dashboard */}
+      <div style={{ padding: "18px 16px 8px" }}>
+        <div style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 16, padding: 16, boxShadow: "0 2px 8px rgba(13,27,42,0.06)" }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 12 }}>
+            <div>
+              <div style={{ fontSize: 10, color: C.textMuted, fontWeight: 800, textTransform: "uppercase", letterSpacing: ".09em" }}>Current Inventory Value</div>
+              <div style={{ marginTop: 4, fontSize: 38, lineHeight: 1, color: C.navy, fontFamily: "'DM Serif Display', serif" }}>{metrics ? money(metrics.currentValue) : "—"}</div>
+            </div>
+            {metrics?.previousValue > 0 && <Badge color={variancePositive ? C.amber : C.green}>{variancePositive ? "+" : ""}{money(metrics.variance)} vs prior</Badge>}
+          </div>
+
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginTop: 16 }}>
+            <div style={{ background: C.cardAlt, border: `1px solid ${C.border}`, borderRadius: 12, padding: 12 }}>
+              <div style={{ fontSize: 10, color: C.textMuted, fontWeight: 700, textTransform: "uppercase" }}>Previous Inventory</div>
+              <div style={{ fontSize: 21, fontWeight: 700, color: C.navy, marginTop: 4 }}>{metrics ? money(metrics.previousValue) : "—"}</div>
+              <div style={{ fontSize: 10, color: C.textMuted, marginTop: 2 }}>{metrics?.variancePct != null ? `${metrics.variancePct >= 0 ? "+" : ""}${(metrics.variancePct * 100).toFixed(1)}% change` : "No prior snapshot"}</div>
+            </div>
+            <div style={{ background: daysOnHand != null && daysOnHand > 30 ? C.amberBg : C.greenBg, border: `1px solid ${daysOnHand != null && daysOnHand > 30 ? C.amberBorder : C.greenBorder}`, borderRadius: 12, padding: 12 }}>
+              <div style={{ fontSize: 10, color: C.textMuted, fontWeight: 700, textTransform: "uppercase" }}>Days on Hand</div>
+              <div style={{ fontSize: 21, fontWeight: 700, color: C.navy, marginTop: 4 }}>{daysOnHand == null ? "—" : daysOnHand.toFixed(1)}</div>
+              <div style={{ fontSize: 10, color: C.textMuted, marginTop: 2 }}>{dailyUsage > 0 ? `${money(dailyUsage)}/day avg usage` : "Enter 30-day usage below"}</div>
+            </div>
+          </div>
+
+          <div style={{ marginTop: 16, borderTop: `1px solid ${C.border}`, paddingTop: 14 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10 }}>
+              <div>
+                <div style={{ fontSize: 11, fontWeight: 800, color: C.navy }}>30-day raw material usage / COGS</div>
+                <div style={{ fontSize: 10, color: C.textMuted }}>Used to calculate days on hand: inventory ÷ (30-day usage ÷ 30)</div>
+              </div>
+              <div style={{ position: "relative", width: 126, flexShrink: 0 }}>
+                <span style={{ position: "absolute", left: 10, top: 9, color: C.textMuted, fontWeight: 700 }}>$</span>
+                <input type="number" inputMode="decimal" value={rawMaterial30} onChange={e => saveRawMaterial(e.target.value)} placeholder="0" style={{ width: "100%", border: `1px solid ${C.borderDark}`, borderRadius: 9, padding: "9px 9px 9px 23px", fontSize: 13, fontWeight: 700, color: C.navy, outline: "none", background: "#fff" }} />
+              </div>
+            </div>
+          </div>
+
+          <div style={{ marginTop: 16 }}>
+            <div style={{ fontSize: 10, color: C.textMuted, fontWeight: 800, textTransform: "uppercase", letterSpacing: ".08em", marginBottom: 2 }}>Inventory Dollar Trend</div>
+            <InventoryTrend snapshots={metrics?.snapshots || []} />
+          </div>
+          {metricsError && <div style={{ marginTop: 10, fontSize: 11, color: C.red }}>{metricsError}</div>}
+          {metrics && <div style={{ marginTop: 8, fontSize: 9, color: C.textMuted }}>
+            {metrics.costingBasis === "locked_historical_cost"
+              ? "Historical cost locked: each count is valued at the item cost captured when that inventory was saved."
+              : metrics.costingBasis === "mixed_locked_and_legacy_estimate"
+                ? `Historical cost locking is active. ${metrics.legacyEstimatedLines || 0} older line${(metrics.legacyEstimatedLines || 0) === 1 ? "" : "s"} predate cost locking and are estimated using current item-master cost.`
+                : "Legacy valuation: historical counts are using current item-master cost. Apply the included Supabase cost-lock migration before finalizing new counts."}
+          </div>}
+        </div>
+      </div>
+
+      {/* Count-cycle progress */}
+      {metrics?.activeCycle && (
+        <div style={{ padding: "4px 16px 8px" }}>
+          <div style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 14, padding: 15 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+              <div>
+                <div style={{ fontSize: 10, color: C.textMuted, fontWeight: 800, textTransform: "uppercase", letterSpacing: ".08em" }}>Count Cycle</div>
+                <div style={{ fontSize: 15, fontWeight: 800, color: C.navy, marginTop: 2 }}>{metrics.activeCycle.label || "Current inventory cycle"}</div>
+              </div>
+              <div style={{ textAlign: "right" }}>
+                <div style={{ fontSize: 20, fontWeight: 800, color: C.gold }}>{metrics.activeCycle.completedAreas}/{metrics.activeCycle.totalAreas}</div>
+                <div style={{ fontSize: 9, color: C.textMuted }}>areas complete</div>
+              </div>
+            </div>
+            <div style={{ height: 7, background: C.border, borderRadius: 4, overflow: "hidden", marginTop: 10 }}>
+              <div style={{ width: `${Math.round((metrics.activeCycle.progressPct || 0) * 100)}%`, height: "100%", background: C.gold, borderRadius: 4 }} />
+            </div>
+            <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginTop: 10 }}>
+              {(metrics.activeCycle.areas || []).map(a => <Badge key={a.areaId} color={a.complete ? C.green : C.textMuted}>{a.complete ? "✓ " : "○ "}{a.areaName}</Badge>)}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Root-cause / dollar drivers */}
+      {metrics?.rootCause && (
+        <div style={{ padding: "4px 16px 8px" }}>
+          <div style={{ background: C.navy, borderRadius: 14, padding: 16 }}>
+            <div style={{ fontSize: 10, color: C.goldLight, fontWeight: 800, textTransform: "uppercase", letterSpacing: ".09em" }}>Inventory Intelligence</div>
+            <div style={{ marginTop: 5, fontSize: 16, color: "#fff", fontFamily: "'DM Serif Display', serif", lineHeight: 1.3 }}>{metrics.rootCause.headline}</div>
+            <div style={{ marginTop: 7, fontSize: 11, color: "#ffffffb8", lineHeight: 1.55 }}>{metrics.rootCause.narrative}</div>
+            {(metrics.rootCause.drivers || []).length > 0 && <div style={{ marginTop: 12, display: "flex", flexDirection: "column", gap: 6 }}>
+              {metrics.rootCause.drivers.slice(0,5).map(d => (
+                <div key={d.itemId} style={{ display: "flex", justifyContent: "space-between", gap: 10, padding: "7px 9px", background: "#ffffff0e", borderRadius: 8 }}>
+                  <div style={{ minWidth: 0 }}><div style={{ fontSize: 11, fontWeight: 700, color: "#fff", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{d.name}</div><div style={{ fontSize: 9, color: "#ffffff88" }}>{d.categoryName}</div></div>
+                  <div style={{ fontSize: 12, fontWeight: 800, color: d.variance >= 0 ? C.goldLight : "#8ee3b4", flexShrink: 0 }}>{d.variance >= 0 ? "+" : "−"}{money(Math.abs(d.variance))}</div>
+                </div>
+              ))}
+            </div>}
+          </div>
+        </div>
+      )}
+
+      {/* Category inventory / DOH */}
+      {(metrics?.categories || []).length > 0 && (
+        <div style={{ padding: "4px 16px 8px" }}>
+          <div style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 14, padding: 15 }}>
+            <div style={{ fontSize: 10, color: C.textMuted, fontWeight: 800, textTransform: "uppercase", letterSpacing: ".08em" }}>Category Inventory & Days on Hand</div>
+            <div style={{ fontSize: 10, color: C.textMuted, marginTop: 3, marginBottom: 10 }}>Enter trailing 30-day usage by category for an accurate category DOH.</div>
+            <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+              {metrics.categories.slice(0,10).map(cat => {
+                const key = cat.categoryId || "uncategorized";
+                const usage = Number(categoryUsage30[key] || 0);
+                const doh = usage > 0 ? cat.currentValue / (usage / 30) : null;
+                return <div key={key} style={{ padding: 10, background: C.cardAlt, border: `1px solid ${C.border}`, borderRadius: 10 }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", gap: 8, alignItems: "center" }}>
+                    <div style={{ minWidth: 0 }}>
+                      <div style={{ fontSize: 12, fontWeight: 800, color: C.navy }}>{cat.categoryName}</div>
+                      <div style={{ fontSize: 10, color: C.textMuted }}>{money(cat.currentValue)} · {cat.variance >= 0 ? "+" : ""}{money(cat.variance)} vs prior</div>
+                    </div>
+                    <div style={{ textAlign: "right", flexShrink: 0 }}>
+                      <div style={{ fontSize: 17, fontWeight: 800, color: doh != null && doh > 30 ? C.amber : C.navy }}>{doh == null ? "—" : doh.toFixed(1)}</div>
+                      <div style={{ fontSize: 9, color: C.textMuted }}>DOH</div>
+                    </div>
+                  </div>
+                  <div style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 7 }}>
+                    <span style={{ fontSize: 9, color: C.textMuted, flex: 1 }}>30-day usage</span>
+                    <span style={{ fontSize: 10, color: C.textMuted }}>$</span>
+                    <input type="number" inputMode="decimal" value={categoryUsage30[key] || ""} onChange={e => saveCategoryUsage(key, e.target.value)} placeholder="0" style={{ width: 88, border: `1px solid ${C.borderDark}`, borderRadius: 7, padding: "6px 7px", fontSize: 11, fontWeight: 700, outline: "none", background: "#fff" }} />
+                  </div>
+                </div>;
+              })}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* SKU dollar variance */}
+      {(metrics?.itemVariances || []).length > 0 && (
+        <div style={{ padding: "4px 16px 8px" }}>
+          <div style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 14, padding: 15 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
+              <div style={{ fontSize: 10, color: C.textMuted, fontWeight: 800, textTransform: "uppercase", letterSpacing: ".08em" }}>Largest SKU Dollar Variances</div>
+              <Badge color={C.gold}>{Math.min(10, metrics.itemVariances.length)} shown</Badge>
+            </div>
+            {metrics.itemVariances.slice(0,10).map(v => <div key={v.itemId} style={{ display: "grid", gridTemplateColumns: "1fr auto", gap: 8, padding: "8px 0", borderTop: `1px solid ${C.border}` }}>
+              <div style={{ minWidth: 0 }}><div style={{ fontSize: 11, fontWeight: 700, color: C.navy, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{v.name}</div><div style={{ fontSize: 9, color: C.textMuted }}>{money(v.previousValue)} → {money(v.currentValue)}</div></div>
+              <div style={{ fontSize: 12, fontWeight: 800, color: v.variance > 0 ? C.amber : v.variance < 0 ? C.green : C.textMuted }}>{v.variance >= 0 ? "+" : "−"}{money(Math.abs(v.variance))}</div>
+            </div>)}
+          </div>
+        </div>
+      )}
+
+      {/* Count integrity */}
+      {metrics?.statusCounts && Object.keys(metrics.statusCounts).length > 0 && (
+        <div style={{ padding: "4px 16px 8px" }}>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(2,1fr)", gap: 8 }}>
+            {[["counted","Counted"],["zero_confirmed","Zero Confirmed"],["not_seen","Not Seen"],["not_counted","Not Counted"],["needs_review","Needs Review"],["partial","Come Back Later"]].filter(([k]) => (metrics.statusCounts[k] || 0) > 0 || ["counted","zero_confirmed","not_seen","not_counted"].includes(k)).map(([k,label]) => <div key={k} style={{ background:C.card,border:`1px solid ${k==="needs_review"&&metrics.statusCounts[k]>0?C.redBorder:k==="partial"&&metrics.statusCounts[k]>0?C.amberBorder:C.border}`,borderRadius:11,padding:11 }}><div style={{ fontSize:18,fontWeight:800,color:C.navy }}>{metrics.statusCounts[k] || 0}</div><div style={{ fontSize:9,color:C.textMuted,textTransform:"uppercase",fontWeight:700 }}>{label}</div></div>)}
+          </div>
+        </div>
+      )}
+
+      {/* Per-area review-threshold calibration -- closes the loop from manager
+          overrides back into how strictly an area gets reviewed. */}
+      {(metrics?.areaCalibration || []).length > 0 && (
+        <div style={{ padding: "4px 16px 8px" }}>
+          <div style={{ background: C.card, border: `1px solid ${C.amberBorder}`, borderRadius: 14, padding: 15 }}>
+            <div style={{ fontSize: 10, color: C.textMuted, fontWeight: 800, textTransform: "uppercase", letterSpacing: ".08em", marginBottom: 10 }}>Review Threshold Suggestions</div>
+            {metrics.areaCalibration.map(a => {
+              const applied = settings?.areaThresholds?.[a.areaId] === a.suggestedThreshold;
+              return (
+                <div key={a.areaId} style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, padding: "8px 0", borderTop: `1px solid ${C.border}` }}>
+                  <div style={{ minWidth: 0 }}>
+                    <p style={{ margin: 0, fontSize: 12, fontWeight: 700, color: C.navy }}>{a.areaName}</p>
+                    <p style={{ margin: "1px 0 0", fontSize: 10.5, color: C.textMuted }}>{Math.round(a.overrideRate * 100)}% of counted lines needed correction over {a.sampleSize} recent lines</p>
+                  </div>
+                  <button onClick={() => setSettings?.(s => ({ ...s, areaThresholds: { ...s.areaThresholds, [a.areaId]: applied ? undefined : a.suggestedThreshold } }))}
+                    style={{ flexShrink: 0, background: applied ? C.navy : C.goldDim, border: `1px solid ${applied ? C.navy : C.goldBorder}`, color: applied ? "#fff" : C.navy, borderRadius: 8, padding: "7px 10px", fontSize: 11, fontWeight: 700, cursor: "pointer" }}>
+                    {applied ? `Applied ${Math.round(a.suggestedThreshold * 100)}%` : `Raise to ${Math.round(a.suggestedThreshold * 100)}%`}
+                  </button>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
+      {/* Operating stats */}
+      <div style={{ padding: "8px 16px", display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
         {[
           { label: "Locations", value: locations.length, icon: "location" },
           { label: "Storage Areas", value: areaCount, icon: "dashboard" },
           { label: "Master Items", value: items.length, icon: "pkg" },
           { label: "Area Assignments", value: assignments.length, icon: "list" },
         ].map(s => (
-          <div key={s.label} style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 14, padding: 16, boxShadow: "0 1px 3px rgba(13,27,42,0.05)" }}>
-            <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 6 }}>
-              <span style={{ fontSize: 10, color: C.textMuted, fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.07em" }}>{s.label}</span>
-              <Icon name={s.icon} size={15} color={C.gold} />
-            </div>
-            <div style={{ fontSize: 30, fontWeight: 400, color: C.navy, fontFamily: "'DM Serif Display', serif", lineHeight: 1 }}>{s.value}</div>
+          <div key={s.label} style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 14, padding: 14, boxShadow: "0 1px 3px rgba(13,27,42,0.05)" }}>
+            <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 6 }}><span style={{ fontSize: 9, color: C.textMuted, fontWeight: 700, textTransform: "uppercase", letterSpacing: ".07em" }}>{s.label}</span><Icon name={s.icon} size={14} color={C.gold} /></div>
+            <div style={{ fontSize: 26, fontWeight: 400, color: C.navy, fontFamily: "'DM Serif Display', serif", lineHeight: 1 }}>{s.value}</div>
           </div>
         ))}
       </div>
 
-      {/* Quick actions */}
       <div style={{ padding: "12px 16px" }}>
         <p style={{ fontSize: 11, fontWeight: 700, color: C.textMuted, textTransform: "uppercase", letterSpacing: "0.1em", margin: "0 0 10px" }}>Quick Actions</p>
         <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
@@ -630,24 +955,26 @@ const Dashboard = ({ locations, items, assignments, navigate }) => {
             { label: "Sites & Areas", icon: "location", screen: "sites" },
           ].map(a => (
             <button key={a.label} onClick={() => navigate(a.screen)} style={{ background: a.featured ? C.navy : C.card, border: `1px solid ${a.featured ? C.navy : C.border}`, borderRadius: 14, padding: "16px 14px", cursor: "pointer", display: "flex", alignItems: "center", gap: 12, textAlign: "left", boxShadow: "0 1px 3px rgba(13,27,42,0.05)" }}>
-              <div style={{ width: 38, height: 38, borderRadius: 10, background: a.featured ? C.gold : C.goldDim, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
-                <Icon name={a.icon} size={19} color={a.featured ? C.navy : C.gold} />
-              </div>
+              <div style={{ width: 38, height: 38, borderRadius: 10, background: a.featured ? C.gold : C.goldDim, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}><Icon name={a.icon} size={19} color={a.featured ? C.navy : C.gold} /></div>
               <span style={{ fontSize: 13, fontWeight: 700, color: a.featured ? "#fff" : C.navy, lineHeight: 1.3 }}>{a.label}</span>
             </button>
           ))}
         </div>
       </div>
 
-      {/* Sites overview */}
+      {metrics?.areas?.length > 0 && <div style={{ padding: "8px 16px 4px" }}>
+        <p style={{ fontSize: 11, fontWeight: 700, color: C.textMuted, textTransform: "uppercase", letterSpacing: "0.1em", margin: "0 0 10px" }}>Inventory by Area</p>
+        {metrics.areas.slice(0, 6).map(a => <div key={a.areaId} style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 10, padding: "10px 12px", marginBottom: 7, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+          <div><div style={{ fontSize: 12, fontWeight: 700, color: C.navy }}>{a.areaName}</div><div style={{ fontSize: 10, color: C.textMuted }}>{new Date(a.date).toLocaleDateString()}</div></div>
+          <div style={{ textAlign: "right" }}><div style={{ fontSize: 13, fontWeight: 800, color: C.navy }}>{money(a.value)}</div>{a.previousValue > 0 && <div style={{ fontSize: 9, color: a.value <= a.previousValue ? C.green : C.amber }}>{a.value >= a.previousValue ? "+" : ""}{money(a.value - a.previousValue)}</div>}</div>
+        </div>)}
+      </div>}
+
       <div style={{ padding: "8px 16px 0" }}>
         <p style={{ fontSize: 11, fontWeight: 700, color: C.textMuted, textTransform: "uppercase", letterSpacing: "0.1em", margin: "0 0 10px" }}>Your Sites</p>
         {locations.map(loc => (
           <div key={loc.id} onClick={() => navigate("capture")} style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 12, padding: 14, marginBottom: 8, display: "flex", justifyContent: "space-between", alignItems: "center", cursor: "pointer", boxShadow: "0 1px 3px rgba(13,27,42,0.05)" }}>
-            <div>
-              <p style={{ margin: 0, fontSize: 14, fontWeight: 700, color: C.navy }}>{loc.name}</p>
-              <p style={{ margin: "2px 0 0", fontSize: 11, color: C.textMuted }}>{loc.areas.length} areas · {loc.type}</p>
-            </div>
+            <div><p style={{ margin: 0, fontSize: 14, fontWeight: 700, color: C.navy }}>{loc.name}</p><p style={{ margin: "2px 0 0", fontSize: 11, color: C.textMuted }}>{loc.areas.length} areas · {loc.type}</p></div>
             <Icon name="arrow" size={15} color={C.gold} />
           </div>
         ))}
@@ -656,7 +983,7 @@ const Dashboard = ({ locations, items, assignments, navigate }) => {
   );
 };
 
-// ─── SCREEN: Sites & Areas (fully user-customized) ───────────────────────────
+// ─── SCREEN: Sites & Areas// ─── SCREEN: Sites & Areas (fully user-customized) ───────────────────────────
 const SitesScreen = ({ locations, setLocations, settings, role }) => {
   const isManager = role === "manager";
   const [modal, setModal] = useState(null); // null | "add" | loc
@@ -1885,75 +2212,339 @@ const ReviewScreen = ({ navigate, countItems, setCountItems, countMeta, settings
 // counted in a session before this can safely roll up total par vs. total on-hand.
 const OrdersScreen = ({ countItems, items, assignments, role }) => {
   const isManager = role === "manager";
-  const counted = (countItems || []).filter(i => i.sku && i.matchStatus !== "unknown");
-  const rows = [];
-  const bySku = new Map();
-  counted.forEach(ci => {
-    const cur = bySku.get(ci.sku) || { ...ci, totalOnHand: 0 };
-    cur.totalOnHand += (ci.override ?? ci.aiCount);
-    bySku.set(ci.sku, cur);
-  });
-  bySku.forEach(ci => {
-    const masterItem = items.find(i => i.sku === ci.sku);
-    const totalPar = ci.par ?? 0; // this area's par only -- see note above
-    if (totalPar > ci.totalOnHand) rows.push({ ...ci, totalPar, orderQty: totalPar - ci.totalOnHand, vendor: masterItem?.vendor || "—", cost: (totalPar - ci.totalOnHand) * (ci.price || masterItem?.price || 0) });
-  });
-  const [selected, setSelected] = useState(rows.map(() => true));
-  const total = rows.reduce((s, r, i) => s + (selected[i] ? r.cost : 0), 0);
+  const [tab, setTab] = useState("reorder");
+  const [metrics, setMetrics] = useState(null);
+  const [metricsError, setMetricsError] = useState("");
+  const [metricsLoading, setMetricsLoading] = useState(true);
+  const [tagging, setTagging] = useState(null); // the areaItemVariance row being tagged
+  const [tagSaving, setTagSaving] = useState(false);
+  const [tagNote, setTagNote] = useState("");
+
+  useEffect(() => {
+    setMetricsLoading(true);
+    fetchInventoryMetrics()
+      .then(m => { setMetrics(m); setMetricsError(""); })
+      .catch(e => setMetricsError(e.message || "Could not load reorder suggestions"))
+      .finally(() => setMetricsLoading(false));
+  }, []);
+
+  // Server-computed suggestions reflect every finalized count across every area (real
+  // operational data). If that's not available yet (brand-new catalog, or the metrics
+  // call failed), fall back to rolling up just the count sitting in this browser session
+  // right now, same as the original single-area behavior.
+  const serverRows = metrics?.reorderSuggestions || [];
+  const useServerRows = serverRows.length > 0 || (!metricsLoading && !metricsError);
+  const localRows = (() => {
+    const counted = (countItems || []).filter(i => i.sku && i.matchStatus !== "unknown");
+    const bySku = new Map();
+    counted.forEach(ci => {
+      const cur = bySku.get(ci.sku) || { ...ci, totalOnHand: 0 };
+      cur.totalOnHand += (ci.override ?? ci.aiCount);
+      bySku.set(ci.sku, cur);
+    });
+    const out = [];
+    bySku.forEach(ci => {
+      const masterItem = items.find(i => i.sku === ci.sku);
+      const totalPar = ci.par ?? 0; // this area's par only
+      if (totalPar > ci.totalOnHand) out.push({ itemId: masterItem?.id || ci.sku, name: ci.name, sku: ci.sku, unit: ci.unit, onHand: ci.totalOnHand, totalPar, orderQty: totalPar - ci.totalOnHand, vendor: masterItem?.vendor || "—", estCost: (totalPar - ci.totalOnHand) * (ci.price || masterItem?.price || 0) });
+    });
+    return out;
+  })();
+  const rows = useServerRows ? serverRows : localRows;
+  const usingLocalFallback = !useServerRows && localRows.length > 0;
+
+  const [selected, setSelected] = useState({});
+  useEffect(() => { setSelected(Object.fromEntries(rows.map(r => [r.itemId, true]))); }, [rows.length, useServerRows]);
+  const total = rows.reduce((s, r) => s + (selected[r.itemId] !== false ? r.estCost : 0), 0);
+
+  const openTagger = (row) => { setTagging(row); setTagNote(row.varianceNote || ""); };
+  const saveTag = async (tagKey) => {
+    if (!tagging) return;
+    setTagSaving(true);
+    try {
+      await tagVariance(tagging.countItemId, tagKey, tagNote);
+      setMetrics(m => ({ ...m, areaItemVariances: m.areaItemVariances.map(v => v.countItemId === tagging.countItemId ? { ...v, varianceTag: tagKey, varianceNote: tagNote } : v) }));
+      setTagging(null);
+    } catch (e) {
+      setMetricsError(e.message || "Could not save tag");
+    } finally {
+      setTagSaving(false);
+    }
+  };
+
+  const areaVariances = metrics?.areaItemVariances || [];
+  const untaggedCount = areaVariances.filter(v => !v.varianceTag).length;
 
   return (
     <div style={{ padding: "24px 16px 100px" }}>
       <h1 style={{ fontSize: 24, fontWeight: 400, color: C.navy, margin: 0, fontFamily: "'DM Serif Display', serif" }}>Purchase Orders</h1>
-      <p style={{ fontSize: 13, color: C.textSub, margin: "4px 0 18px" }}>Based on your most recent area count vs. that area's par level</p>
+      <p style={{ fontSize: 13, color: C.textSub, margin: "4px 0 16px" }}>Reorder suggestions and variance review, drawn from finalized counts</p>
 
-      {rows.length === 0 ? (
-        <div style={{ textAlign: "center", padding: "48px 20px", background: C.card, border: `1px solid ${C.border}`, borderRadius: 16 }}>
-          <p style={{ fontSize: 15, fontWeight: 400, color: C.navy, margin: "0 0 8px", fontFamily: "'DM Serif Display', serif" }}>Nothing to reorder</p>
-          <p style={{ fontSize: 12, color: C.textSub, lineHeight: 1.6 }}>Run a count and any items below their combined par levels will appear here.</p>
-        </div>
-      ) : (
+      <div style={{ display: "flex", background: C.cardAlt, border: `1px solid ${C.border}`, borderRadius: 12, padding: 4, marginBottom: 16 }}>
+        {[["reorder", "Reorder"], ["variance", `Variance Review${untaggedCount > 0 ? ` (${untaggedCount})` : ""}`]].map(([k, label]) => (
+          <button key={k} onClick={() => setTab(k)} style={{ flex: 1, background: tab === k ? C.navy : "transparent", border: "none", color: tab === k ? "#fff" : C.textSub, borderRadius: 9, padding: "10px", fontWeight: 700, fontSize: 12, cursor: "pointer" }}>{label}</button>
+        ))}
+      </div>
+
+      {tab === "reorder" && (
         <>
-          <div style={{ marginBottom: 16, padding: 16, background: C.navy, borderRadius: 14, display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
-            <div style={{ textAlign: "center" }}>
-              <div style={{ fontSize: 26, fontWeight: 400, color: C.gold, fontFamily: "'DM Serif Display', serif" }}>${total.toFixed(0)}</div>
-              <div style={{ fontSize: 10, color: "#ffffff99", textTransform: "uppercase", letterSpacing: "0.08em" }}>Est. Total</div>
+          {usingLocalFallback && (
+            <div style={{ padding: "10px 14px", background: C.blueBg, border: `1px solid ${C.blue}44`, borderRadius: 10, marginBottom: 14 }}>
+              <span style={{ fontSize: 11.5, color: C.blue, fontWeight: 600 }}>Showing shortfalls from the count you just finished — this will switch to suggestions across all areas' finalized counts on next load.</span>
             </div>
-            <div style={{ textAlign: "center" }}>
-              <div style={{ fontSize: 26, fontWeight: 400, color: "#fff", fontFamily: "'DM Serif Display', serif" }}>{selected.filter(Boolean).length}</div>
-              <div style={{ fontSize: 10, color: "#ffffff99", textTransform: "uppercase", letterSpacing: "0.08em" }}>Line Items</div>
+          )}
+          {metricsError && !usingLocalFallback && (
+            <div style={{ padding: "10px 14px", background: C.amberBg, border: `1px solid ${C.amberBorder}`, borderRadius: 10, marginBottom: 14 }}>
+              <span style={{ fontSize: 12, color: C.amber, fontWeight: 600 }}>{metricsError}</span>
             </div>
-          </div>
-          <div style={{ display: "flex", flexDirection: "column", gap: 8, marginBottom: 16 }}>
-            {rows.map((r, i) => (
-              <div key={r.sku} onClick={() => setSelected(s => s.map((v, x) => x === i ? !v : v))} style={{ background: C.card, border: `1px solid ${selected[i] ? C.goldBorder : C.border}`, borderRadius: 12, padding: 14, cursor: "pointer", display: "flex", gap: 10, boxShadow: "0 1px 3px rgba(13,27,42,0.05)" }}>
-                <div style={{ width: 22, height: 22, borderRadius: 6, background: selected[i] ? C.navy : C.cardAlt, border: `1px solid ${selected[i] ? C.navy : C.borderDark}`, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0, marginTop: 1 }}>{selected[i] && <Icon name="check" size={12} color={C.gold} />}</div>
-                <div style={{ flex: 1 }}>
-                  <div style={{ display: "flex", justifyContent: "space-between" }}>
-                    <p style={{ margin: 0, fontSize: 13, fontWeight: 700, color: C.navy }}>{r.name}</p>
-                    <span style={{ fontSize: 13, fontWeight: 700, color: C.green }}>${r.cost.toFixed(0)}</span>
-                  </div>
-                  <p style={{ margin: "2px 0 6px", fontSize: 11, color: C.textMuted }}>{r.vendor}</p>
-                  <p style={{ margin: 0, fontSize: 12, color: C.textSub }}>On hand <strong style={{ color: C.red }}>{r.totalOnHand}</strong> · area par <strong>{r.totalPar}</strong> → order <strong style={{ color: C.navy }}>{r.orderQty} {r.unit}</strong></p>
-                </div>
-              </div>
-            ))}
-          </div>
-          {isManager ? (
-            <div style={{ display: "flex", gap: 10 }}>
-              <button style={{ flex: 1, background: C.card, border: `1px solid ${C.borderDark}`, color: C.textSub, borderRadius: 12, padding: 14, fontWeight: 700, fontSize: 13, cursor: "pointer" }}>Export PDF</button>
-              <GoldBtn style={{ flex: 2, padding: 14 }}>Submit to Vendors</GoldBtn>
+          )}
+          {metricsLoading && !rows.length ? (
+            <div style={{ textAlign: "center", padding: 40 }}>
+              <div style={{ width: 32, height: 32, borderRadius: "50%", border: `3px solid ${C.goldDim}`, borderTopColor: C.gold, animation: "spin 0.8s linear infinite", margin: "0 auto" }} />
+            </div>
+          ) : rows.length === 0 ? (
+            <div style={{ textAlign: "center", padding: "48px 20px", background: C.card, border: `1px solid ${C.border}`, borderRadius: 16 }}>
+              <p style={{ fontSize: 15, fontWeight: 400, color: C.navy, margin: "0 0 8px", fontFamily: "'DM Serif Display', serif" }}>Nothing to reorder</p>
+              <p style={{ fontSize: 12, color: C.textSub, lineHeight: 1.6 }}>Once counts are finalized, any items below their combined par levels will appear here.</p>
             </div>
           ) : (
-            <div style={{ padding: "10px 14px", background: C.cardAlt, border: `1px solid ${C.border}`, borderRadius: 10, textAlign: "center" }}>
-              <p style={{ margin: 0, fontSize: 12, color: C.textSub }}>View-only — ask a manager to export or submit this order.</p>
+            <>
+              <div style={{ marginBottom: 16, padding: 16, background: C.navy, borderRadius: 14, display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+                <div style={{ textAlign: "center" }}>
+                  <div style={{ fontSize: 26, fontWeight: 400, color: C.gold, fontFamily: "'DM Serif Display', serif" }}>${total.toFixed(0)}</div>
+                  <div style={{ fontSize: 10, color: "#ffffff99", textTransform: "uppercase", letterSpacing: "0.08em" }}>Est. Total</div>
+                </div>
+                <div style={{ textAlign: "center" }}>
+                  <div style={{ fontSize: 26, fontWeight: 400, color: "#fff", fontFamily: "'DM Serif Display', serif" }}>{Object.values(selected).filter(v => v !== false).length}</div>
+                  <div style={{ fontSize: 10, color: "#ffffff99", textTransform: "uppercase", letterSpacing: "0.08em" }}>Line Items</div>
+                </div>
+              </div>
+              <div style={{ display: "flex", flexDirection: "column", gap: 8, marginBottom: 16 }}>
+                {rows.map((r) => {
+                  const isSelected = selected[r.itemId] !== false;
+                  return (
+                    <div key={r.itemId} onClick={() => setSelected(s => ({ ...s, [r.itemId]: !isSelected }))} style={{ background: C.card, border: `1px solid ${isSelected ? C.goldBorder : C.border}`, borderRadius: 12, padding: 14, cursor: "pointer", display: "flex", gap: 10, boxShadow: "0 1px 3px rgba(13,27,42,0.05)" }}>
+                      <div style={{ width: 22, height: 22, borderRadius: 6, background: isSelected ? C.navy : C.cardAlt, border: `1px solid ${isSelected ? C.navy : C.borderDark}`, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0, marginTop: 1 }}>{isSelected && <Icon name="check" size={12} color={C.gold} />}</div>
+                      <div style={{ flex: 1 }}>
+                        <div style={{ display: "flex", justifyContent: "space-between" }}>
+                          <p style={{ margin: 0, fontSize: 13, fontWeight: 700, color: C.navy }}>{r.name}</p>
+                          <span style={{ fontSize: 13, fontWeight: 700, color: C.green }}>${r.estCost.toFixed(0)}</span>
+                        </div>
+                        <p style={{ margin: "2px 0 6px", fontSize: 11, color: C.textMuted }}>{r.vendor || "No vendor set"}</p>
+                        <p style={{ margin: 0, fontSize: 12, color: C.textSub }}>On hand <strong style={{ color: C.red }}>{r.onHand}</strong> · total par <strong>{r.totalPar}</strong> → order <strong style={{ color: C.navy }}>{r.orderQty} {r.unit || ""}</strong></p>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+              {isManager ? (
+                <div style={{ display: "flex", gap: 10 }}>
+                  <button style={{ flex: 1, background: C.card, border: `1px solid ${C.borderDark}`, color: C.textSub, borderRadius: 12, padding: 14, fontWeight: 700, fontSize: 13, cursor: "pointer" }}>Export PDF</button>
+                  <GoldBtn style={{ flex: 2, padding: 14 }}>Submit to Vendors</GoldBtn>
+                </div>
+              ) : (
+                <div style={{ padding: "10px 14px", background: C.cardAlt, border: `1px solid ${C.border}`, borderRadius: 10, textAlign: "center" }}>
+                  <p style={{ margin: 0, fontSize: 12, color: C.textSub }}>View-only — ask a manager to export or submit this order.</p>
+                </div>
+              )}
+            </>
+          )}
+        </>
+      )}
+
+      {tab === "variance" && (
+        <>
+          <div style={{ padding: "10px 14px", background: C.blueBg, border: `1px solid ${C.blue}44`, borderRadius: 10, marginBottom: 14 }}>
+            <p style={{ margin: 0, fontSize: 11.5, color: C.blue, fontWeight: 600, lineHeight: 1.5 }}>Lines with a meaningful swing from the prior count in the same area, ranked by dollar impact. Tagging a cause builds a pattern over time instead of re-investigating the same SKU every cycle.</p>
+          </div>
+          {metricsLoading && !areaVariances.length ? (
+            <div style={{ textAlign: "center", padding: 40 }}>
+              <div style={{ width: 32, height: 32, borderRadius: "50%", border: `3px solid ${C.goldDim}`, borderTopColor: C.gold, animation: "spin 0.8s linear infinite", margin: "0 auto" }} />
+            </div>
+          ) : areaVariances.length === 0 ? (
+            <div style={{ textAlign: "center", padding: "48px 20px", background: C.card, border: `1px solid ${C.border}`, borderRadius: 16 }}>
+              <p style={{ fontSize: 15, fontWeight: 400, color: C.navy, margin: "0 0 8px", fontFamily: "'DM Serif Display', serif" }}>No variance yet</p>
+              <p style={{ fontSize: 12, color: C.textSub, lineHeight: 1.6 }}>Once an area has two finalized counts, swings between them will show up here.</p>
+            </div>
+          ) : (
+            <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+              {areaVariances.map(v => (
+                <div key={v.countItemId} style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 12, padding: 14, boxShadow: "0 1px 3px rgba(13,27,42,0.05)" }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", gap: 8 }}>
+                    <div style={{ minWidth: 0 }}>
+                      <p style={{ margin: 0, fontSize: 13, fontWeight: 700, color: C.navy, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{v.name}</p>
+                      <p style={{ margin: "2px 0 0", fontSize: 11, color: C.textMuted }}>{v.areaName} · {v.previousQty} → {v.currentQty}</p>
+                    </div>
+                    <span style={{ fontSize: 13, fontWeight: 800, color: v.valueDelta < 0 ? C.red : C.green, flexShrink: 0 }}>{v.valueDelta >= 0 ? "+" : "−"}{money(Math.abs(v.valueDelta))}</span>
+                  </div>
+                  <div style={{ marginTop: 10, display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
+                    {v.varianceTag ? (
+                      <Badge color={C.navy}>{VARIANCE_TAGS.find(([k]) => k === v.varianceTag)?.[1] || v.varianceTag}</Badge>
+                    ) : (
+                      <span style={{ fontSize: 11, color: C.textMuted }}>Untagged</span>
+                    )}
+                    {isManager && <button onClick={() => openTagger(v)} style={{ background: C.goldDim, border: `1px solid ${C.goldBorder}`, color: C.navy, borderRadius: 8, padding: "7px 12px", fontSize: 11, fontWeight: 700, cursor: "pointer" }}>{v.varianceTag ? "Edit Tag" : "Tag Cause"}</button>}
+                  </div>
+                </div>
+              ))}
             </div>
           )}
         </>
+      )}
+
+      {tagging && (
+        <Modal title={`Tag: ${tagging.name}`} onClose={() => setTagging(null)}>
+          <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+            <p style={{ margin: 0, fontSize: 12, color: C.textSub, lineHeight: 1.5 }}>{tagging.areaName} · {tagging.previousQty} → {tagging.currentQty} ({tagging.valueDelta >= 0 ? "+" : "−"}{money(Math.abs(tagging.valueDelta))})</p>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+              {VARIANCE_TAGS.map(([k, label]) => (
+                <button key={k} onClick={() => saveTag(k)} disabled={tagSaving} style={{ background: tagging.varianceTag === k ? C.navy : C.cardAlt, border: `1px solid ${tagging.varianceTag === k ? C.navy : C.border}`, color: tagging.varianceTag === k ? "#fff" : C.text, borderRadius: 9, padding: 10, fontWeight: 700, fontSize: 12, cursor: "pointer" }}>{label}</button>
+              ))}
+            </div>
+            <FInput label="Note (optional)" value={tagNote} onChange={setTagNote} placeholder="e.g. banquet used extra cases, not on ticket" />
+            {tagging.varianceTag && <button onClick={() => saveTag(null)} disabled={tagSaving} style={{ background: "none", border: "none", color: C.textMuted, fontSize: 12, fontWeight: 600, cursor: "pointer", textAlign: "center" }}>Clear tag</button>}
+          </div>
+        </Modal>
       )}
     </div>
   );
 };
 
+// ─── SCREEN: Approvals ─────────────────────────────────────────────────────────
+// Closes a gap that existed even before this update: turning on "Require approval
+// before finalizing" set a count's status to 'submitted' and nothing ever moved it
+// forward. This is that missing approve/reject step, plus a read-only audit log of who
+// did what. Actor identity comes from the caller's verified auth token (see
+// finalize-count.js) -- there's no free-text "your name" field to spoof.
+const EVENT_LABELS = { submitted: "Submitted", approved: "Approved", rejected: "Rejected", finalized: "Finalized" };
+const EVENT_COLORS = { submitted: "amber", approved: "green", rejected: "red", finalized: "green" };
+
+const ApprovalsScreen = () => {
+  const [metrics, setMetrics] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+  const [decidingId, setDecidingId] = useState(null);
+  const [rejecting, setRejecting] = useState(null); // pending approval row being rejected
+  const [rejectReason, setRejectReason] = useState("");
+  const [showLog, setShowLog] = useState(false);
+
+  const load = () => {
+    setLoading(true);
+    fetchInventoryMetrics()
+      .then(m => { setMetrics(m); setError(""); })
+      .catch(e => setError(e.message || "Could not load approvals"))
+      .finally(() => setLoading(false));
+  };
+  useEffect(load, []);
+
+  const approve = async (row) => {
+    setDecidingId(row.countId);
+    try {
+      await decideCount("approve", row.countId);
+      setMetrics(m => ({ ...m, pendingApprovals: m.pendingApprovals.filter(p => p.countId !== row.countId) }));
+    } catch (e) {
+      setError(e.message || "Could not approve this count");
+    } finally {
+      setDecidingId(null);
+    }
+  };
+
+  const submitReject = async () => {
+    if (!rejecting || !rejectReason.trim()) return;
+    setDecidingId(rejecting.countId);
+    try {
+      await decideCount("reject", rejecting.countId, rejectReason);
+      setMetrics(m => ({ ...m, pendingApprovals: m.pendingApprovals.filter(p => p.countId !== rejecting.countId) }));
+      setRejecting(null); setRejectReason("");
+    } catch (e) {
+      setError(e.message || "Could not reject this count");
+    } finally {
+      setDecidingId(null);
+    }
+  };
+
+  const pending = metrics?.pendingApprovals || [];
+  const auditLog = metrics?.auditLog || [];
+
+  return (
+    <div style={{ padding: "24px 16px 100px" }}>
+      <h1 style={{ fontSize: 24, fontWeight: 400, color: C.navy, margin: 0, fontFamily: "'DM Serif Display', serif" }}>Approvals</h1>
+      <p style={{ fontSize: 13, color: C.textSub, margin: "4px 0 16px" }}>Counts submitted for sign-off, and a log of who did what</p>
+
+      {error && (
+        <div style={{ padding: "10px 14px", background: C.redBg, border: `1px solid ${C.redBorder}`, borderRadius: 10, marginBottom: 14 }}>
+          <span style={{ fontSize: 12, color: C.red, fontWeight: 600 }}>{error}</span>
+        </div>
+      )}
+
+      {loading && !metrics ? (
+        <div style={{ textAlign: "center", padding: 40 }}>
+          <div style={{ width: 32, height: 32, borderRadius: "50%", border: `3px solid ${C.goldDim}`, borderTopColor: C.gold, animation: "spin 0.8s linear infinite", margin: "0 auto" }} />
+        </div>
+      ) : pending.length === 0 ? (
+        <div style={{ textAlign: "center", padding: "40px 20px", background: C.card, border: `1px solid ${C.border}`, borderRadius: 16, marginBottom: 20 }}>
+          <p style={{ fontSize: 15, fontWeight: 400, color: C.navy, margin: "0 0 8px", fontFamily: "'DM Serif Display', serif" }}>Nothing waiting</p>
+          <p style={{ fontSize: 12, color: C.textSub, lineHeight: 1.6 }}>Counts submitted under "Require approval" will show up here.</p>
+        </div>
+      ) : (
+        <div style={{ display: "flex", flexDirection: "column", gap: 10, marginBottom: 20 }}>
+          {pending.map(row => (
+            <div key={row.countId} style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 14, padding: 14, boxShadow: "0 1px 3px rgba(13,27,42,0.05)" }}>
+              <div style={{ display: "flex", justifyContent: "space-between", gap: 8 }}>
+                <p style={{ margin: 0, fontSize: 14, fontWeight: 700, color: C.navy }}>{row.areaName}</p>
+                <span style={{ fontSize: 13, fontWeight: 700, color: C.navy }}>{money(row.totalValue)}</span>
+              </div>
+              <p style={{ margin: "3px 0 12px", fontSize: 11, color: C.textMuted }}>
+                {row.itemCount} item{row.itemCount !== 1 ? "s" : ""} · submitted {new Date(row.submittedAt).toLocaleString()}
+              </p>
+              <div style={{ display: "flex", gap: 8 }}>
+                <button onClick={() => setRejecting(row)} disabled={decidingId === row.countId} style={{ flex: 1, background: C.redBg, border: `1px solid ${C.redBorder}`, color: C.red, borderRadius: 9, padding: 10, fontSize: 12, fontWeight: 700, cursor: "pointer" }}>Reject</button>
+                <button onClick={() => approve(row)} disabled={decidingId === row.countId} style={{ flex: 2, background: C.navy, border: "none", color: "#fff", borderRadius: 9, padding: 10, fontSize: 12, fontWeight: 800, cursor: "pointer" }}>
+                  {decidingId === row.countId ? "Saving…" : "Approve"}
+                </button>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      <button onClick={() => setShowLog(s => !s)} style={{ width: "100%", display: "flex", alignItems: "center", justifyContent: "space-between", background: "none", border: "none", padding: "4px 2px 8px", cursor: "pointer" }}>
+        <span style={{ fontSize: 11, fontWeight: 700, color: C.textMuted, textTransform: "uppercase", letterSpacing: "0.08em" }}>Recent Activity</span>
+        <span style={{ fontSize: 11, color: C.gold, fontWeight: 700 }}>{showLog ? "Hide" : "Show"}</span>
+      </button>
+      {showLog && (
+        auditLog.length === 0 ? (
+          <p style={{ fontSize: 12, color: C.textMuted, padding: "8px 2px" }}>Nothing logged yet.</p>
+        ) : (
+          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+            {auditLog.map(e => (
+              <div key={e.id} style={{ display: "flex", alignItems: "center", gap: 10, padding: "8px 10px", background: C.cardAlt, borderRadius: 9 }}>
+                <Badge color={C[EVENT_COLORS[e.eventType]] || C.textMuted}>{EVENT_LABELS[e.eventType] || e.eventType}</Badge>
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <p style={{ margin: 0, fontSize: 11.5, color: C.navy, fontWeight: 600, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{e.areaName}</p>
+                  {e.note && <p style={{ margin: "1px 0 0", fontSize: 10.5, color: C.textMuted, fontStyle: "italic" }}>"{e.note}"</p>}
+                </div>
+                <span style={{ fontSize: 10, color: C.textMuted, flexShrink: 0 }}>{new Date(e.createdAt).toLocaleDateString()}</span>
+              </div>
+            ))}
+          </div>
+        )
+      )}
+
+      {rejecting && (
+        <Modal title={`Reject: ${rejecting.areaName}`} onClose={() => { setRejecting(null); setRejectReason(""); }}>
+          <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+            <p style={{ margin: 0, fontSize: 12, color: C.textSub, lineHeight: 1.5 }}>This sends the count back rather than finalizing it. A reason is required so the counter knows what to fix.</p>
+            <FInput label="Reason" value={rejectReason} onChange={setRejectReason} placeholder="e.g. missing the top shelf, please recount" />
+            <PrimaryBtn onClick={submitReject} disabled={!rejectReason.trim() || decidingId === rejecting.countId}>{decidingId === rejecting.countId ? "Saving…" : "Reject Count"}</PrimaryBtn>
+          </div>
+        </Modal>
+      )}
+    </div>
+  );
+};
+
+// ─── SCREEN: Team (manager-only member management)
 // ─── SCREEN: Team (manager-only member management) ───────────────────────────
 const TeamSection = () => {
   const [members, setMembers] = useState(null);
@@ -2352,12 +2943,13 @@ const AppShell = ({ auth, onSignOut }) => {
   }
 
   const screens = {
-    dashboard: <Dashboard locations={locations} items={items} assignments={assignments} navigate={setScreen} />,
+    dashboard: <Dashboard locations={locations} items={items} assignments={assignments} navigate={setScreen} settings={settings} setSettings={setSettings} />,
     sites:     <SitesScreen locations={locations} setLocations={setLocations} settings={settings} role={auth.role} />,
     catalog:   <CatalogScreen items={items} setItems={setItems} assignments={assignments} setAssignments={setAssignments} locations={locations} settings={settings} setSettings={setSettings} role={auth.role} />,
     capture:   <CaptureScreen locations={locations} items={items} assignments={assignments} stages={stages} setStages={setStages} settings={settings} navigate={setScreen} onComplete={(r, m) => { setCountItems(r); setCountMeta(m); }} />,
     review:    <ReviewScreen navigate={setScreen} countItems={countItems} setCountItems={setCountItems} countMeta={countMeta} settings={settings} items={items} setItems={setItems} assignments={assignments} setAssignments={setAssignments} />,
     orders:    <OrdersScreen countItems={countItems} items={items} assignments={assignments} role={auth.role} />,
+    approvals: <ApprovalsScreen />,
     settings:  <SettingsScreen settings={settings} setSettings={setSettings} auth={auth} onSignOut={onSignOut} />,
   };
 
