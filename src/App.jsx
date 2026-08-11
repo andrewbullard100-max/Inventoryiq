@@ -1796,6 +1796,20 @@ const CaptureScreen = ({ locations, items, assignments, stages, setStages, setti
   const [activeElsewhere, setActiveElsewhere] = useState(null); // { startedAt } | null -- another device is already counting this area
   const [collision, setCollision] = useState(null); // { startedAt, countId } | null -- surfaced when THIS device tries to start and loses the race
   const uploadPromisesRef = useRef({}); // imgId -> Promise<storagePath>
+
+  // Background pre-analysis: once a stage is left behind (addStage is tapped, or a stage
+  // hits its 5-photo cap), its photos are analyzed immediately instead of waiting for the
+  // final "Process" tap. By the time the person finishes the last stage, every earlier
+  // stage's results are usually already sitting in cache, so doProcess only has to wait on
+  // whichever stage is still in flight -- not all of them. `gen` guards against a stage
+  // being analyzed, then getting a new/removed photo before doProcess runs: bumping the
+  // generation invalidates the cached result so it's never merged in stale.
+  const [stageAnalysis, setStageAnalysis] = useState({}); // stageId -> { status: 'analyzing'|'done'|'error', results, gen }
+  const stageAnalysisRef = useRef({}); // mirrors stageAnalysis for reads inside in-flight async closures
+  const stageAnalysisGenRef = useRef({}); // stageId -> generation counter
+  const stageAnalysisPromisesRef = useRef({}); // stageId -> in-flight background analysis Promise
+  useEffect(() => { stageAnalysisRef.current = stageAnalysis; }, [stageAnalysis]);
+
   const [scannedItems, setScannedItems] = useState([]); // [{itemId, sku, name, size, unit, par, price, qty}]
   const [scannerOpen, setScannerOpen] = useState(false);
   const [showPrepTips, setShowPrepTips] = useState(true);
@@ -1832,6 +1846,7 @@ const CaptureScreen = ({ locations, items, assignments, stages, setStages, setti
   // several-hundred-photo count doesn't have to restart from zero after an interruption.
   useEffect(() => {
     setCountId(null); setCompletedStageIds(new Set()); setResumeBanner(null); setResumedResults([]); setActiveElsewhere(null); setCollision(null); uploadPromisesRef.current = {}; setScannedItems([]);
+    setStageAnalysis({}); stageAnalysisRef.current = {}; stageAnalysisGenRef.current = {}; stageAnalysisPromisesRef.current = {};
     if (!area) { setStageList([]); return; }
     const persisted = stages.filter(s => s.areaId === area.id).sort((a, b) => a.sortOrder - b.sortOrder);
     setStageList(persisted.length > 0
@@ -1860,8 +1875,53 @@ const CaptureScreen = ({ locations, items, assignments, stages, setStages, setti
     .map(a => { const it = items.find(i => i.id === a.itemId); return it ? { ...it, par: a.par } : null; })
     .filter(Boolean) : [];
 
-  const addStage = () => setStageList(prev => [...prev, { id: uid("stage"), name: `Stage ${prev.length + 1}`, images: [] }]);
-  const removeStage = (stageId) => setStageList(prev => prev.length > 1 ? prev.filter(s => s.id !== stageId) : prev);
+  // Bumping a stage's generation invalidates any cached/in-flight background analysis for
+  // it -- called whenever that stage's photo set changes after analysis has started.
+  const bumpStageGen = (stageId) => {
+    stageAnalysisGenRef.current[stageId] = (stageAnalysisGenRef.current[stageId] || 0) + 1;
+  };
+
+  // Analyzes one stage's photos right away, in the background, instead of waiting for the
+  // final "Process" tap. Snapshots (areaId/cid/areaItems) are passed in rather than read
+  // from component state at call time, since this runs unattended and the person may have
+  // moved on to a different stage (or, in principle, area) before it resolves.
+  const analyzeStageInBackground = (stage, areaIdSnap, cidSnap, areaItemsSnap) => {
+    if (!stage || stage.images.length === 0 || !cidSnap) return;
+    const existing = stageAnalysisRef.current[stage.id];
+    const gen = stageAnalysisGenRef.current[stage.id] || 0;
+    if (existing && existing.gen === gen && (existing.status === "analyzing" || existing.status === "done")) return; // already covered
+
+    const promise = (async () => {
+      setStageAnalysis(prev => ({ ...prev, [stage.id]: { status: "analyzing", results: null, gen } }));
+      try {
+        const paths = [];
+        for (const img of stage.images) {
+          const pending = uploadPromisesRef.current[img.id];
+          const path = pending ? await pending.catch(() => null) : img.storagePath;
+          if (path) paths.push(path);
+        }
+        if (paths.length === 0) throw new Error("No uploaded photos for this stage.");
+        const backendResults = await analysePhotosViaBackend({ storagePaths: paths, areaId: areaIdSnap, countId: cidSnap, stageId: stage.id, stageName: stage.name });
+        if ((stageAnalysisGenRef.current[stage.id] || 0) !== gen) return; // superseded -- a photo was added/removed since this started
+        const adapted = adaptAnalysisResults(backendResults, areaItemsSnap);
+        adapted.forEach(r => { r.stageId = stage.id; r.stageName = stage.name; });
+        setStageAnalysis(prev => ({ ...prev, [stage.id]: { status: "done", results: adapted, gen } }));
+      } catch (e) {
+        if ((stageAnalysisGenRef.current[stage.id] || 0) !== gen) return;
+        setStageAnalysis(prev => ({ ...prev, [stage.id]: { status: "error", results: null, gen, error: e.message } }));
+      }
+    })();
+    stageAnalysisPromisesRef.current[stage.id] = promise;
+  };
+
+  const addStage = () => {
+    // Moving on to a new stage means the person is done shooting the previous one --
+    // kick its analysis off now instead of waiting for the final Process tap.
+    const prevStage = stageList[stageList.length - 1];
+    if (prevStage && prevStage.images.length > 0) analyzeStageInBackground(prevStage, area.id, countId, areaItems);
+    setStageList(prev => [...prev, { id: uid("stage"), name: `Stage ${prev.length + 1}`, images: [] }]);
+  };
+  const removeStage = (stageId) => { bumpStageGen(stageId); setStageList(prev => prev.length > 1 ? prev.filter(s => s.id !== stageId) : prev); };
   const renameStage = (stageId, name) => setStageList(prev => prev.map(s => s.id === stageId ? { ...s, name } : s));
 
   const patchImage = (stageId, imgId, patch) =>
@@ -1875,6 +1935,9 @@ const CaptureScreen = ({ locations, items, assignments, stages, setStages, setti
   const handleFiles = async (stageId, files) => {
     const valid = Array.from(files).filter(f => f.type.startsWith("image/"));
     if (valid.length === 0) return;
+    // New photos land in this stage -- any cached/in-flight background analysis for it is stale now.
+    bumpStageGen(stageId);
+    const stageBefore = stageList.find(s => s.id === stageId);
 
     // Offline: skip the session/upload calls entirely and hold the photo (with its resized
     // blob, not just a thumbnail) in memory for the offline queue -- see doProcess below.
@@ -1902,6 +1965,7 @@ const CaptureScreen = ({ locations, items, assignments, stages, setStages, setti
       }
     }
 
+    const addedEntries = [];
     for (const file of valid) {
       const imgId = uid("img");
       let entry;
@@ -1909,6 +1973,7 @@ const CaptureScreen = ({ locations, items, assignments, stages, setStages, setti
         const { blob, mediaType, thumbDataUrl } = await processPhotoForCapture(file);
         entry = { id: imgId, thumbDataUrl, name: file.name, sizeKB: Math.round(blob.size / 1024), status: "uploading", storagePath: null };
         setStageList(prev => prev.map(s => s.id === stageId ? { ...s, images: [...s.images, entry].slice(0, 5) } : s));
+        addedEntries.push(entry);
 
         const uploadPromise = uploadPhotoToStorage({ areaId: area.id, stageId, countId: cid, blob, mediaType })
           .then(path => { patchImage(stageId, imgId, { status: "uploaded", storagePath: path }); return path; })
@@ -1919,6 +1984,13 @@ const CaptureScreen = ({ locations, items, assignments, stages, setStages, setti
         setStageList(prev => prev.map(s => s.id === stageId ? { ...s, images: [...s.images, { id: imgId, thumbDataUrl: null, name: file.name, sizeKB: 0, status: "error", error: e.message }].slice(0, 5) } : s));
       }
     }
+
+    // Stage just hit its 5-photo cap -- it's very likely done, so start analyzing now
+    // rather than waiting for the person to notice and tap "Add Stage" or "Process".
+    const finalImages = [...(stageBefore?.images || []), ...addedEntries].slice(0, 5);
+    if (finalImages.length >= 5) {
+      analyzeStageInBackground({ id: stageId, name: stageBefore?.name || "", images: finalImages }, area.id, cid, areaItems);
+    }
   };
 
   // Note: a failed upload doesn't keep its original blob around (memory reasons), so
@@ -1926,6 +1998,7 @@ const CaptureScreen = ({ locations, items, assignments, stages, setStages, setti
   // removing the failed thumbnail (below) and recapturing the photo.
   const removeImage = (stageId, imgId) => {
     delete uploadPromisesRef.current[imgId];
+    bumpStageGen(stageId); // photo set changed -- invalidate any cached/in-flight background analysis for this stage
     setStageList(prev => prev.map(s => s.id === stageId ? { ...s, images: s.images.filter(i => i.id !== imgId) } : s));
   };
 
@@ -2032,6 +2105,21 @@ const CaptureScreen = ({ locations, items, assignments, stages, setStages, setti
 
       let completed = 0;
       const stageResultsList = await runWithConcurrency(activeStages, 3, async (s) => {
+        const gen = stageAnalysisGenRef.current[s.id] || 0;
+        const inFlight = stageAnalysisPromisesRef.current[s.id];
+        // A background analysis already in progress (or finished) for this exact photo set
+        // covers this stage -- wait on it instead of re-calling Vision.
+        if (inFlight) {
+          await inFlight.catch(() => {}); // background analysis already reports its own errors into stageAnalysis
+          const settled = stageAnalysisRef.current[s.id];
+          if (settled && settled.gen === gen && settled.status === "done") {
+            completed++;
+            setStageProgressLabel(`Analysed ${completed} of ${activeStages.length} stages…`);
+            setProgress(Math.round((completed / activeStages.length) * 90));
+            return settled.results;
+          }
+          // Superseded (photo added/removed) or the background call failed -- fall through and redo it fresh below.
+        }
         const storagePaths = s.images.map(img => resolvedPaths[img.id] || img.storagePath).filter(Boolean);
         if (storagePaths.length === 0) return [];
         const backendResults = await analysePhotosViaBackend({ storagePaths, areaId: area.id, countId: cid, stageId: s.id, stageName: s.name });
@@ -2223,6 +2311,19 @@ const CaptureScreen = ({ locations, items, assignments, stages, setStages, setti
                 {completedStageIds.has(s.id) && s.images.length === 0 && (
                   <p style={{ margin: "0 0 10px", fontSize: 11, color: C.green, fontWeight: 700 }}>✓ Already analyzed in this count — add photos here only to redo it</p>
                 )}
+                {(() => {
+                  const a = stageAnalysis[s.id];
+                  if (!a || (stageAnalysisGenRef.current[s.id] || 0) !== a.gen || s.images.length === 0) return null;
+                  if (a.status === "analyzing") return (
+                    <p style={{ margin: "0 0 10px", fontSize: 11, color: C.textSub, fontWeight: 700, display: "flex", alignItems: "center", gap: 6 }}>
+                      <span style={{ width: 10, height: 10, borderRadius: "50%", border: `2px solid ${C.goldDim}`, borderTopColor: C.gold, animation: "spin 0.8s linear infinite" }} />
+                      Analysing in background…
+                    </p>
+                  );
+                  if (a.status === "done") return <p style={{ margin: "0 0 10px", fontSize: 11, color: C.green, fontWeight: 700 }}>✓ Pre-analyzed — ready when you tap Process</p>;
+                  if (a.status === "error") return <p style={{ margin: "0 0 10px", fontSize: 11, color: C.textSub, fontWeight: 700 }}>Will analyze when you tap Process</p>;
+                  return null;
+                })()}
 
                 <div style={{ display: "flex", gap: 8 }}>
                   <button onClick={() => camRefs.current[s.id]?.click()} disabled={s.images.length >= 5} style={{ flex: 1, background: C.cardAlt, border: `1px solid ${C.borderDark}`, color: s.images.length >= 5 ? C.textMuted : C.textSub, borderRadius: 10, padding: "10px", fontWeight: 700, fontSize: 12, cursor: s.images.length >= 5 ? "not-allowed" : "pointer", display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }}><Icon name="camera" size={15} color={s.images.length >= 5 ? C.textMuted : C.textSub} />Photo</button>
