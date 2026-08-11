@@ -237,16 +237,31 @@ async function apiFetch(path, options = {}) {
 // concurrent requests will occasionally get rate-limited or hit a transient
 // error, and that shouldn't fail the whole count.
 async function analysePhotosViaBackend({ storagePaths, areaId, countId, stageId, stageName }, attempt = 1) {
-  const res = await apiFetch("/api/analyze-photos", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ areaId, countId, stageId, stageName, storagePaths }),
-  });
+  const retry = async () => {
+    const delay = Math.min(1500 * 2 ** (attempt - 1), 12000) + Math.random() * 300;
+    await new Promise(r => setTimeout(r, delay));
+    return analysePhotosViaBackend({ storagePaths, areaId, countId, stageId, stageName }, attempt + 1);
+  };
+
+  let res;
+  try {
+    res = await apiFetch("/api/analyze-photos", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ areaId, countId, stageId, stageName, storagePaths }),
+    });
+  } catch (networkErr) {
+    // fetch() itself threw -- a network-layer failure (e.g. iOS Safari's "Load failed")
+    // rather than an HTTP error response. Give it the same backoff-retry treatment as
+    // 429/5xx below, since these are just as transient (dropped connection, brief signal
+    // loss, tab backgrounded mid-request).
+    if (attempt <= 4) return retry();
+    throw new Error("Network connection lost during analysis. Check your signal and try again.");
+  }
+
   if (!res.ok) {
     if ((res.status === 429 || res.status >= 500) && attempt <= 4) {
-      const delay = Math.min(1500 * 2 ** (attempt - 1), 12000) + Math.random() * 300;
-      await new Promise(r => setTimeout(r, delay));
-      return analysePhotosViaBackend({ storagePaths, areaId, countId, stageId, stageName }, attempt + 1);
+      return retry();
     }
     const body = await res.json().catch(() => ({}));
     throw new Error(body.error || `Analysis failed (${res.status})`);
