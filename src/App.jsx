@@ -422,13 +422,17 @@ async function parseInvoice(file) {
 async function loadCatalog() {
   const res = await apiFetch("/api/catalog");
   if (!res.ok) throw new Error(`Failed to load catalog (${res.status})`);
-  const { locations: rawLocations, areas: rawAreas, items: rawItems, assignments: rawAssignments, stages: rawStages } = await res.json();
+  const { locations: rawLocations, areas: rawAreas, items: rawItems, assignments: rawAssignments, stages: rawStages, recentCounts: rawRecentCounts } = await res.json();
 
   const areasByLocation = {};
-  for (const a of rawAreas) (areasByLocation[a.location_id] ||= []).push({ id: a.id, name: a.name });
+  for (const a of rawAreas) (areasByLocation[a.location_id] ||= []).push({
+    id: a.id, name: a.name,
+    countIntervalDays: a.count_interval_days ?? 7,
+    lastCountedAt: a.last_counted_at || null,
+  });
 
   const locations = rawLocations.map(l => ({
-    id: l.id, name: l.name, type: "Foodservice",
+    id: l.id, name: l.name, type: l.type || "Restaurant",
     areas: (areasByLocation[l.id] || []).sort((a, b) => a.name.localeCompare(b.name)),
   }));
 
@@ -452,7 +456,11 @@ async function loadCatalog() {
     id: s.id, areaId: s.area_id, name: s.name, sortOrder: s.sort_order || 0,
   }));
 
-  return { locations, items, assignments, stages };
+  const recentCounts = (rawRecentCounts || []).map(c => ({
+    countId: c.countId, areaId: c.areaId, areaName: c.areaName, status: c.status, date: c.date,
+  }));
+
+  return { locations, items, assignments, stages, recentCounts };
 }
 
 // ─── Backend proxy: catalog writes (items/assignments/stages) ───────────────
@@ -477,6 +485,24 @@ async function saveStagesToBackend(areaId, stagesToSave) {
 
 async function removeStageFromBackend(stageId) {
   return catalogWrite("delete-stage", { id: stageId });
+}
+
+async function saveLocationToBackend(location) {
+  const { locations } = await catalogWrite("upsert-locations", { locations: [{ id: location.id, name: location.name, type: location.type }] });
+  return locations[0]; // { id, name, type }
+}
+
+async function deleteLocationFromBackend(id) {
+  return catalogWrite("delete-location", { id });
+}
+
+async function saveAreasToBackend(locationId, areasToSave) {
+  const { areas } = await catalogWrite("upsert-areas", { locationId, areas: areasToSave.map(a => ({ id: a.id, name: a.name, countIntervalDays: a.countIntervalDays })) });
+  return areas; // [{id, location_id, name, count_interval_days}]
+}
+
+async function deleteAreaFromBackend(id) {
+  return catalogWrite("delete-area", { id });
 }
 
 // ─── Backend proxy: reference photos for hard-to-identify items ─────────────
@@ -716,35 +742,27 @@ async function updateMemberRole(userId, role) { return orgAction("update-role", 
 async function removeMember(userId) { return orgAction("remove-member", { userId }); }
 
 // ─── SCREEN: Dashboard ────────────────────────────────────────────────────────
-const Dashboard = ({ locations, items, assignments, navigate, isOnline, queuePending = 0, readyForReview = [], onOpenReady, settings, setSettings }) => {
-  const areaCount = locations.reduce((sum, l) => sum + l.areas.length, 0);
-  const [metrics, setMetrics] = useState(null);
-  const [metricsError, setMetricsError] = useState("");
-  const [rawMaterial30, setRawMaterial30] = useState(() => {
-    try { return localStorage.getItem("inventoryiq_raw_material_30d") || ""; } catch { return ""; }
-  });
-  const [categoryUsage30, setCategoryUsage30] = useState(() => {
-    try { return JSON.parse(localStorage.getItem("inventoryiq_category_usage_30d") || "{}"); } catch { return {}; }
-  });
+const Dashboard = ({ locations, navigate, isOnline, queuePending = 0, readyForReview = [], onOpenReady, recentCounts = [] }) => {
+  const now = Date.now();
 
-  useEffect(() => {
-    fetchInventoryMetrics().then(setMetrics).catch(e => setMetricsError(e.message || "Could not load inventory value history"));
-  }, []);
+  // "Due Today": an area is due once its last approved count is older than its own
+  // counting interval. Never-counted areas are always due. This is what turns ad hoc
+  // counting into an actual cycle-count program -- the app tells the counter what needs
+  // doing today instead of them having to remember or guess.
+  const dueAreas = [];
+  for (const loc of locations) {
+    for (const area of loc.areas) {
+      const intervalDays = area.countIntervalDays || 7;
+      const daysSince = area.lastCountedAt ? (now - new Date(area.lastCountedAt).getTime()) / 86400000 : Infinity;
+      if (daysSince >= intervalDays) {
+        dueAreas.push({ ...area, locationId: loc.id, locationName: loc.name, daysSince, intervalDays });
+      }
+    }
+  }
+  dueAreas.sort((a, b) => b.daysSince - a.daysSince);
 
-  const saveRawMaterial = (value) => {
-    setRawMaterial30(value);
-    try { localStorage.setItem("inventoryiq_raw_material_30d", value); } catch {}
-  };
-  const saveCategoryUsage = (key, value) => {
-    const next = { ...categoryUsage30, [key]: value };
-    setCategoryUsage30(next);
-    try { localStorage.setItem("inventoryiq_category_usage_30d", JSON.stringify(next)); } catch {}
-  };
-
-  const usage30 = Number(rawMaterial30 || 0);
-  const dailyUsage = usage30 > 0 ? usage30 / 30 : 0;
-  const daysOnHand = dailyUsage > 0 ? (metrics?.currentValue || 0) / dailyUsage : null;
-  const variancePositive = (metrics?.variance || 0) >= 0;
+  const statusLabel = { approved: "Approved", submitted: "Pending Approval", rejected: "Rejected" };
+  const statusColor = { approved: C.green, submitted: C.amber, rejected: C.red };
 
   return (
     <div style={{ paddingBottom: 20 }}>
@@ -756,21 +774,31 @@ const Dashboard = ({ locations, items, assignments, navigate, isOnline, queuePen
             <p style={{ margin: "1px 0 0", fontSize: 11, color: C.goldLight, letterSpacing: "0.06em" }}>Visual counts. Smarter inventory.</p>
           </div>
         </div>
-        <div style={{ marginTop: 16, padding: "10px 14px", background: "#ffffff12", border: `1px solid ${C.gold}55`, borderRadius: 10, display: "flex", alignItems: "center", gap: 10 }}>
-          <Icon name="ai" size={15} color={C.gold} />
-          <span style={{ fontSize: 12, color: "#fff", fontWeight: 600 }}>Claude Vision ready — photograph any area to count</span>
-        </div>
 
         {isOnline === false && (
-          <div style={{ marginTop: 10, padding: "10px 14px", background: "#ffffff12", border: `1px solid #ffffff33`, borderRadius: 10, display: "flex", alignItems: "center", gap: 10 }}>
+          <div style={{ marginTop: 16, padding: "10px 14px", background: "#ffffff12", border: `1px solid #ffffff33`, borderRadius: 10, display: "flex", alignItems: "center", gap: 10 }}>
             <span style={{ width: 8, height: 8, borderRadius: "50%", background: C.gold, flexShrink: 0 }} />
             <span style={{ fontSize: 12, color: "#fff", fontWeight: 600 }}>Offline{queuePending > 0 ? ` — ${queuePending} count${queuePending !== 1 ? "s" : ""} queued, will sync automatically` : ""}</span>
           </div>
         )}
       </div>
 
-      {(queuePending > 0 || readyForReview.length > 0 || (metrics?.pendingApprovals?.length || 0) > 0) && (
-        <div style={{ padding: "18px 16px 0" }}>
+      {/* The one thing this screen is for. */}
+      <div style={{ padding: "18px 16px 6px" }}>
+        <button onClick={() => navigate("capture")} style={{ width: "100%", background: C.navy, border: "none", borderRadius: 16, padding: "22px 18px", cursor: "pointer", display: "flex", alignItems: "center", gap: 14, boxShadow: "0 4px 16px rgba(13,27,42,0.18)" }}>
+          <div style={{ width: 48, height: 48, borderRadius: 12, background: C.gold, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
+            <Icon name="camera" size={24} color={C.navy} />
+          </div>
+          <div style={{ textAlign: "left", flex: 1 }}>
+            <p style={{ margin: 0, fontSize: 17, fontWeight: 700, color: "#fff" }}>Start Count</p>
+            <p style={{ margin: "2px 0 0", fontSize: 12, color: "#ffffffaa" }}>Photograph a shelf or scan barcodes</p>
+          </div>
+          <Icon name="arrow" size={18} color={C.gold} />
+        </button>
+      </div>
+
+      {(queuePending > 0 || readyForReview.length > 0) && (
+        <div style={{ padding: "12px 16px 0" }}>
           {queuePending > 0 && (
             <div style={{ background: C.blueBg, border: `1px solid ${C.blue}33`, borderRadius: 14, padding: 14, display: "flex", alignItems: "center", gap: 12, marginBottom: 10 }}>
               <div style={{ width: 36, height: 36, borderRadius: 10, background: "#fff", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}><Icon name="upload" size={17} color={C.blue} /></div>
@@ -778,16 +806,6 @@ const Dashboard = ({ locations, items, assignments, navigate, isOnline, queuePen
                 <p style={{ margin: 0, fontSize: 12.5, fontWeight: 800, color: C.navy }}>{queuePending} count{queuePending !== 1 ? "s" : ""} waiting to sync</p>
                 <p style={{ margin: "1px 0 0", fontSize: 11, color: C.textSub }}>Saved on this device — will analyse automatically once you're back online.</p>
               </div>
-            </div>
-          )}
-          {(metrics?.pendingApprovals?.length || 0) > 0 && (
-            <div onClick={() => navigate("approvals")} style={{ background: C.amberBg, border: `1px solid ${C.amberBorder}`, borderRadius: 14, padding: 14, display: "flex", alignItems: "center", gap: 12, marginBottom: 10, cursor: "pointer" }}>
-              <div style={{ width: 36, height: 36, borderRadius: 10, background: "#fff", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}><Icon name="shield" size={17} color={C.amber} /></div>
-              <div style={{ flex: 1 }}>
-                <p style={{ margin: 0, fontSize: 12.5, fontWeight: 800, color: C.navy }}>{metrics.pendingApprovals.length} count{metrics.pendingApprovals.length !== 1 ? "s" : ""} awaiting approval</p>
-                <p style={{ margin: "1px 0 0", fontSize: 11, color: C.textSub }}>Submitted and waiting on a manager sign-off.</p>
-              </div>
-              <Icon name="arrow" size={16} color={C.amber} />
             </div>
           )}
           {readyForReview.map(entry => (
@@ -803,257 +821,104 @@ const Dashboard = ({ locations, items, assignments, navigate, isOnline, queuePen
         </div>
       )}
 
-      {/* Financial inventory dashboard */}
-      <div style={{ padding: "18px 16px 8px" }}>
-        <div style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 16, padding: 16, boxShadow: "0 2px 8px rgba(13,27,42,0.06)" }}>
-          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 12 }}>
-            <div>
-              <div style={{ fontSize: 10, color: C.textMuted, fontWeight: 800, textTransform: "uppercase", letterSpacing: ".09em" }}>Current Inventory Value</div>
-              <div style={{ marginTop: 4, fontSize: 38, lineHeight: 1, color: C.navy, fontFamily: "'DM Serif Display', serif" }}>{metrics ? money(metrics.currentValue) : "—"}</div>
-            </div>
-            {metrics?.previousValue > 0 && <Badge color={variancePositive ? C.amber : C.green}>{variancePositive ? "+" : ""}{money(metrics.variance)} vs prior</Badge>}
+      {/* Due Today: what needs counting, driven by each area's own interval. */}
+      <div style={{ padding: "18px 16px 4px" }}>
+        <p style={{ fontSize: 11, fontWeight: 700, color: C.textMuted, textTransform: "uppercase", letterSpacing: "0.1em", margin: "0 0 10px" }}>Due Today</p>
+        {dueAreas.length === 0 ? (
+          <div style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 14, padding: 16, textAlign: "center" }}>
+            <p style={{ margin: 0, fontSize: 13, color: C.textSub }}>Nothing due — every area's been counted recently. Nice work.</p>
           </div>
-
-          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginTop: 16 }}>
-            <div style={{ background: C.cardAlt, border: `1px solid ${C.border}`, borderRadius: 12, padding: 12 }}>
-              <div style={{ fontSize: 10, color: C.textMuted, fontWeight: 700, textTransform: "uppercase" }}>Previous Inventory</div>
-              <div style={{ fontSize: 21, fontWeight: 700, color: C.navy, marginTop: 4 }}>{metrics ? money(metrics.previousValue) : "—"}</div>
-              <div style={{ fontSize: 10, color: C.textMuted, marginTop: 2 }}>{metrics?.variancePct != null ? `${metrics.variancePct >= 0 ? "+" : ""}${(metrics.variancePct * 100).toFixed(1)}% change` : "No prior snapshot"}</div>
-            </div>
-            <div style={{ background: daysOnHand != null && daysOnHand > 30 ? C.amberBg : C.greenBg, border: `1px solid ${daysOnHand != null && daysOnHand > 30 ? C.amberBorder : C.greenBorder}`, borderRadius: 12, padding: 12 }}>
-              <div style={{ fontSize: 10, color: C.textMuted, fontWeight: 700, textTransform: "uppercase" }}>Days on Hand</div>
-              <div style={{ fontSize: 21, fontWeight: 700, color: C.navy, marginTop: 4 }}>{daysOnHand == null ? "—" : daysOnHand.toFixed(1)}</div>
-              <div style={{ fontSize: 10, color: C.textMuted, marginTop: 2 }}>{dailyUsage > 0 ? `${money(dailyUsage)}/day avg usage` : "Enter 30-day usage below"}</div>
-            </div>
-          </div>
-
-          <div style={{ marginTop: 16, borderTop: `1px solid ${C.border}`, paddingTop: 14 }}>
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10 }}>
-              <div>
-                <div style={{ fontSize: 11, fontWeight: 800, color: C.navy }}>30-day raw material usage / COGS</div>
-                <div style={{ fontSize: 10, color: C.textMuted }}>Used to calculate days on hand: inventory ÷ (30-day usage ÷ 30)</div>
-              </div>
-              <div style={{ position: "relative", width: 126, flexShrink: 0 }}>
-                <span style={{ position: "absolute", left: 10, top: 9, color: C.textMuted, fontWeight: 700 }}>$</span>
-                <input type="number" inputMode="decimal" value={rawMaterial30} onChange={e => saveRawMaterial(e.target.value)} placeholder="0" style={{ width: "100%", border: `1px solid ${C.borderDark}`, borderRadius: 9, padding: "9px 9px 9px 23px", fontSize: 13, fontWeight: 700, color: C.navy, outline: "none", background: "#fff" }} />
-              </div>
-            </div>
-          </div>
-
-          <div style={{ marginTop: 16 }}>
-            <div style={{ fontSize: 10, color: C.textMuted, fontWeight: 800, textTransform: "uppercase", letterSpacing: ".08em", marginBottom: 2 }}>Inventory Dollar Trend</div>
-            <InventoryTrend snapshots={metrics?.snapshots || []} />
-          </div>
-          {metricsError && <div style={{ marginTop: 10, fontSize: 11, color: C.red }}>{metricsError}</div>}
-          {metrics && <div style={{ marginTop: 8, fontSize: 9, color: C.textMuted }}>
-            {metrics.costingBasis === "locked_historical_cost"
-              ? "Historical cost locked: each count is valued at the item cost captured when that inventory was saved."
-              : metrics.costingBasis === "mixed_locked_and_legacy_estimate"
-                ? `Historical cost locking is active. ${metrics.legacyEstimatedLines || 0} older line${(metrics.legacyEstimatedLines || 0) === 1 ? "" : "s"} predate cost locking and are estimated using current item-master cost.`
-                : "Legacy valuation: historical counts are using current item-master cost. Apply the included Supabase cost-lock migration before finalizing new counts."}
-          </div>}
-        </div>
-      </div>
-
-      {/* Count-cycle progress */}
-      {metrics?.activeCycle && (
-        <div style={{ padding: "4px 16px 8px" }}>
-          <div style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 14, padding: 15 }}>
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-              <div>
-                <div style={{ fontSize: 10, color: C.textMuted, fontWeight: 800, textTransform: "uppercase", letterSpacing: ".08em" }}>Count Cycle</div>
-                <div style={{ fontSize: 15, fontWeight: 800, color: C.navy, marginTop: 2 }}>{metrics.activeCycle.label || "Current inventory cycle"}</div>
-              </div>
-              <div style={{ textAlign: "right" }}>
-                <div style={{ fontSize: 20, fontWeight: 800, color: C.gold }}>{metrics.activeCycle.completedAreas}/{metrics.activeCycle.totalAreas}</div>
-                <div style={{ fontSize: 9, color: C.textMuted }}>areas complete</div>
-              </div>
-            </div>
-            <div style={{ height: 7, background: C.border, borderRadius: 4, overflow: "hidden", marginTop: 10 }}>
-              <div style={{ width: `${Math.round((metrics.activeCycle.progressPct || 0) * 100)}%`, height: "100%", background: C.gold, borderRadius: 4 }} />
-            </div>
-            <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginTop: 10 }}>
-              {(metrics.activeCycle.areas || []).map(a => <Badge key={a.areaId} color={a.complete ? C.green : C.textMuted}>{a.complete ? "✓ " : "○ "}{a.areaName}</Badge>)}
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* Root-cause / dollar drivers */}
-      {metrics?.rootCause && (
-        <div style={{ padding: "4px 16px 8px" }}>
-          <div style={{ background: C.navy, borderRadius: 14, padding: 16 }}>
-            <div style={{ fontSize: 10, color: C.goldLight, fontWeight: 800, textTransform: "uppercase", letterSpacing: ".09em" }}>Inventory Intelligence</div>
-            <div style={{ marginTop: 5, fontSize: 16, color: "#fff", fontFamily: "'DM Serif Display', serif", lineHeight: 1.3 }}>{metrics.rootCause.headline}</div>
-            <div style={{ marginTop: 7, fontSize: 11, color: "#ffffffb8", lineHeight: 1.55 }}>{metrics.rootCause.narrative}</div>
-            {(metrics.rootCause.drivers || []).length > 0 && <div style={{ marginTop: 12, display: "flex", flexDirection: "column", gap: 6 }}>
-              {metrics.rootCause.drivers.slice(0,5).map(d => (
-                <div key={d.itemId} style={{ display: "flex", justifyContent: "space-between", gap: 10, padding: "7px 9px", background: "#ffffff0e", borderRadius: 8 }}>
-                  <div style={{ minWidth: 0 }}><div style={{ fontSize: 11, fontWeight: 700, color: "#fff", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{d.name}</div><div style={{ fontSize: 9, color: "#ffffff88" }}>{d.categoryName}</div></div>
-                  <div style={{ fontSize: 12, fontWeight: 800, color: d.variance >= 0 ? C.goldLight : "#8ee3b4", flexShrink: 0 }}>{d.variance >= 0 ? "+" : "−"}{money(Math.abs(d.variance))}</div>
+        ) : (
+          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+            {dueAreas.map(a => (
+              <div key={a.id} onClick={() => navigate("capture")} style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 12, padding: "12px 14px", display: "flex", alignItems: "center", gap: 10, cursor: "pointer", boxShadow: "0 1px 3px rgba(13,27,42,0.05)" }}>
+                <div style={{ width: 8, height: 8, borderRadius: "50%", background: a.daysSince === Infinity ? C.textMuted : a.daysSince > a.intervalDays * 2 ? C.red : C.amber, flexShrink: 0 }} />
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <p style={{ margin: 0, fontSize: 13, fontWeight: 700, color: C.navy }}>{a.name}</p>
+                  <p style={{ margin: "1px 0 0", fontSize: 11, color: C.textMuted }}>{a.locationName} · {a.daysSince === Infinity ? "never counted" : `last counted ${Math.floor(a.daysSince)}d ago`}</p>
                 </div>
-              ))}
-            </div>}
+                <Icon name="arrow" size={15} color={C.gold} />
+              </div>
+            ))}
           </div>
-        </div>
-      )}
+        )}
+      </div>
 
-      {/* Category inventory / DOH */}
-      {(metrics?.categories || []).length > 0 && (
-        <div style={{ padding: "4px 16px 8px" }}>
-          <div style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 14, padding: 15 }}>
-            <div style={{ fontSize: 10, color: C.textMuted, fontWeight: 800, textTransform: "uppercase", letterSpacing: ".08em" }}>Category Inventory & Days on Hand</div>
-            <div style={{ fontSize: 10, color: C.textMuted, marginTop: 3, marginBottom: 10 }}>Enter trailing 30-day usage by category for an accurate category DOH.</div>
-            <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-              {metrics.categories.slice(0,10).map(cat => {
-                const key = cat.categoryId || "uncategorized";
-                const usage = Number(categoryUsage30[key] || 0);
-                const doh = usage > 0 ? cat.currentValue / (usage / 30) : null;
-                return <div key={key} style={{ padding: 10, background: C.cardAlt, border: `1px solid ${C.border}`, borderRadius: 10 }}>
-                  <div style={{ display: "flex", justifyContent: "space-between", gap: 8, alignItems: "center" }}>
-                    <div style={{ minWidth: 0 }}>
-                      <div style={{ fontSize: 12, fontWeight: 800, color: C.navy }}>{cat.categoryName}</div>
-                      <div style={{ fontSize: 10, color: C.textMuted }}>{money(cat.currentValue)} · {cat.variance >= 0 ? "+" : ""}{money(cat.variance)} vs prior</div>
-                    </div>
-                    <div style={{ textAlign: "right", flexShrink: 0 }}>
-                      <div style={{ fontSize: 17, fontWeight: 800, color: doh != null && doh > 30 ? C.amber : C.navy }}>{doh == null ? "—" : doh.toFixed(1)}</div>
-                      <div style={{ fontSize: 9, color: C.textMuted }}>DOH</div>
-                    </div>
-                  </div>
-                  <div style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 7 }}>
-                    <span style={{ fontSize: 9, color: C.textMuted, flex: 1 }}>30-day usage</span>
-                    <span style={{ fontSize: 10, color: C.textMuted }}>$</span>
-                    <input type="number" inputMode="decimal" value={categoryUsage30[key] || ""} onChange={e => saveCategoryUsage(key, e.target.value)} placeholder="0" style={{ width: 88, border: `1px solid ${C.borderDark}`, borderRadius: 7, padding: "6px 7px", fontSize: 11, fontWeight: 700, outline: "none", background: "#fff" }} />
-                  </div>
-                </div>;
-              })}
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* SKU dollar variance */}
-      {(metrics?.itemVariances || []).length > 0 && (
-        <div style={{ padding: "4px 16px 8px" }}>
-          <div style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 14, padding: 15 }}>
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
-              <div style={{ fontSize: 10, color: C.textMuted, fontWeight: 800, textTransform: "uppercase", letterSpacing: ".08em" }}>Largest SKU Dollar Variances</div>
-              <Badge color={C.gold}>{Math.min(10, metrics.itemVariances.length)} shown</Badge>
-            </div>
-            {metrics.itemVariances.slice(0,10).map(v => <div key={v.itemId} style={{ display: "grid", gridTemplateColumns: "1fr auto", gap: 8, padding: "8px 0", borderTop: `1px solid ${C.border}` }}>
-              <div style={{ minWidth: 0 }}><div style={{ fontSize: 11, fontWeight: 700, color: C.navy, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{v.name}</div><div style={{ fontSize: 9, color: C.textMuted }}>{money(v.previousValue)} → {money(v.currentValue)}</div></div>
-              <div style={{ fontSize: 12, fontWeight: 800, color: v.variance > 0 ? C.amber : v.variance < 0 ? C.green : C.textMuted }}>{v.variance >= 0 ? "+" : "−"}{money(Math.abs(v.variance))}</div>
-            </div>)}
-          </div>
-        </div>
-      )}
-
-      {/* Count integrity */}
-      {metrics?.statusCounts && Object.keys(metrics.statusCounts).length > 0 && (
-        <div style={{ padding: "4px 16px 8px" }}>
-          <div style={{ display: "grid", gridTemplateColumns: "repeat(2,1fr)", gap: 8 }}>
-            {[["counted","Counted"],["zero_confirmed","Zero Confirmed"],["not_seen","Not Seen"],["not_counted","Not Counted"],["needs_review","Needs Review"],["partial","Come Back Later"]].filter(([k]) => (metrics.statusCounts[k] || 0) > 0 || ["counted","zero_confirmed","not_seen","not_counted"].includes(k)).map(([k,label]) => <div key={k} style={{ background:C.card,border:`1px solid ${k==="needs_review"&&metrics.statusCounts[k]>0?C.redBorder:k==="partial"&&metrics.statusCounts[k]>0?C.amberBorder:C.border}`,borderRadius:11,padding:11 }}><div style={{ fontSize:18,fontWeight:800,color:C.navy }}>{metrics.statusCounts[k] || 0}</div><div style={{ fontSize:9,color:C.textMuted,textTransform:"uppercase",fontWeight:700 }}>{label}</div></div>)}
-          </div>
-        </div>
-      )}
-
-      {/* Per-area review-threshold calibration -- closes the loop from manager
-          overrides back into how strictly an area gets reviewed. */}
-      {(metrics?.areaCalibration || []).length > 0 && (
-        <div style={{ padding: "4px 16px 8px" }}>
-          <div style={{ background: C.card, border: `1px solid ${C.amberBorder}`, borderRadius: 14, padding: 15 }}>
-            <div style={{ fontSize: 10, color: C.textMuted, fontWeight: 800, textTransform: "uppercase", letterSpacing: ".08em", marginBottom: 10 }}>Review Threshold Suggestions</div>
-            {metrics.areaCalibration.map(a => {
-              const applied = settings?.areaThresholds?.[a.areaId] === a.suggestedThreshold;
-              return (
-                <div key={a.areaId} style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, padding: "8px 0", borderTop: `1px solid ${C.border}` }}>
-                  <div style={{ minWidth: 0 }}>
-                    <p style={{ margin: 0, fontSize: 12, fontWeight: 700, color: C.navy }}>{a.areaName}</p>
-                    <p style={{ margin: "1px 0 0", fontSize: 10.5, color: C.textMuted }}>{Math.round(a.overrideRate * 100)}% of counted lines needed correction over {a.sampleSize} recent lines</p>
-                  </div>
-                  <button onClick={() => setSettings?.(s => ({ ...s, areaThresholds: { ...s.areaThresholds, [a.areaId]: applied ? undefined : a.suggestedThreshold } }))}
-                    style={{ flexShrink: 0, background: applied ? C.navy : C.goldDim, border: `1px solid ${applied ? C.navy : C.goldBorder}`, color: applied ? "#fff" : C.navy, borderRadius: 8, padding: "7px 10px", fontSize: 11, fontWeight: 700, cursor: "pointer" }}>
-                    {applied ? `Applied ${Math.round(a.suggestedThreshold * 100)}%` : `Raise to ${Math.round(a.suggestedThreshold * 100)}%`}
-                  </button>
+      {/* My Recent Counts */}
+      {recentCounts.length > 0 && (
+        <div style={{ padding: "14px 16px 4px" }}>
+          <p style={{ fontSize: 11, fontWeight: 700, color: C.textMuted, textTransform: "uppercase", letterSpacing: "0.1em", margin: "0 0 10px" }}>My Recent Counts</p>
+          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+            {recentCounts.slice(0, 6).map(c => (
+              <div key={c.countId} style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, background: C.card, border: `1px solid ${C.border}`, borderRadius: 10, padding: "9px 12px" }}>
+                <div style={{ minWidth: 0 }}>
+                  <p style={{ margin: 0, fontSize: 12.5, fontWeight: 700, color: C.navy, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{c.areaName}</p>
+                  <p style={{ margin: "1px 0 0", fontSize: 10.5, color: C.textMuted }}>{new Date(c.date).toLocaleDateString(undefined, { month: "short", day: "numeric" })}</p>
                 </div>
-              );
-            })}
+                <Badge color={statusColor[c.status] || C.textMuted}>{statusLabel[c.status] || c.status}</Badge>
+              </div>
+            ))}
           </div>
         </div>
       )}
-
-      {/* Operating stats */}
-      <div style={{ padding: "8px 16px", display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
-        {[
-          { label: "Locations", value: locations.length, icon: "location" },
-          { label: "Storage Areas", value: areaCount, icon: "dashboard" },
-          { label: "Master Items", value: items.length, icon: "pkg" },
-          { label: "Area Assignments", value: assignments.length, icon: "list" },
-        ].map(s => (
-          <div key={s.label} style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 14, padding: 14, boxShadow: "0 1px 3px rgba(13,27,42,0.05)" }}>
-            <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 6 }}><span style={{ fontSize: 9, color: C.textMuted, fontWeight: 700, textTransform: "uppercase", letterSpacing: ".07em" }}>{s.label}</span><Icon name={s.icon} size={14} color={C.gold} /></div>
-            <div style={{ fontSize: 26, fontWeight: 400, color: C.navy, fontFamily: "'DM Serif Display', serif", lineHeight: 1 }}>{s.value}</div>
-          </div>
-        ))}
-      </div>
-
-      <div style={{ padding: "12px 16px" }}>
-        <p style={{ fontSize: 11, fontWeight: 700, color: C.textMuted, textTransform: "uppercase", letterSpacing: "0.1em", margin: "0 0 10px" }}>Quick Actions</p>
-        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
-          {[
-            { label: "Start Count", icon: "camera", screen: "capture", featured: true },
-            { label: "Item Catalog", icon: "pkg", screen: "catalog" },
-            { label: "Purchase Orders", icon: "order", screen: "orders" },
-            { label: "Sites & Areas", icon: "location", screen: "sites" },
-          ].map(a => (
-            <button key={a.label} onClick={() => navigate(a.screen)} style={{ background: a.featured ? C.navy : C.card, border: `1px solid ${a.featured ? C.navy : C.border}`, borderRadius: 14, padding: "16px 14px", cursor: "pointer", display: "flex", alignItems: "center", gap: 12, textAlign: "left", boxShadow: "0 1px 3px rgba(13,27,42,0.05)" }}>
-              <div style={{ width: 38, height: 38, borderRadius: 10, background: a.featured ? C.gold : C.goldDim, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}><Icon name={a.icon} size={19} color={a.featured ? C.navy : C.gold} /></div>
-              <span style={{ fontSize: 13, fontWeight: 700, color: a.featured ? "#fff" : C.navy, lineHeight: 1.3 }}>{a.label}</span>
-            </button>
-          ))}
-        </div>
-      </div>
-
-      {metrics?.areas?.length > 0 && <div style={{ padding: "8px 16px 4px" }}>
-        <p style={{ fontSize: 11, fontWeight: 700, color: C.textMuted, textTransform: "uppercase", letterSpacing: "0.1em", margin: "0 0 10px" }}>Inventory by Area</p>
-        {metrics.areas.slice(0, 6).map(a => <div key={a.areaId} style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 10, padding: "10px 12px", marginBottom: 7, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-          <div><div style={{ fontSize: 12, fontWeight: 700, color: C.navy }}>{a.areaName}</div><div style={{ fontSize: 10, color: C.textMuted }}>{new Date(a.date).toLocaleDateString()}</div></div>
-          <div style={{ textAlign: "right" }}><div style={{ fontSize: 13, fontWeight: 800, color: C.navy }}>{money(a.value)}</div>{a.previousValue > 0 && <div style={{ fontSize: 9, color: a.value <= a.previousValue ? C.green : C.amber }}>{a.value >= a.previousValue ? "+" : ""}{money(a.value - a.previousValue)}</div>}</div>
-        </div>)}
-      </div>}
-
-      <div style={{ padding: "8px 16px 0" }}>
-        <p style={{ fontSize: 11, fontWeight: 700, color: C.textMuted, textTransform: "uppercase", letterSpacing: "0.1em", margin: "0 0 10px" }}>Your Sites</p>
-        {locations.map(loc => (
-          <div key={loc.id} onClick={() => navigate("capture")} style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 12, padding: 14, marginBottom: 8, display: "flex", justifyContent: "space-between", alignItems: "center", cursor: "pointer", boxShadow: "0 1px 3px rgba(13,27,42,0.05)" }}>
-            <div><p style={{ margin: 0, fontSize: 14, fontWeight: 700, color: C.navy }}>{loc.name}</p><p style={{ margin: "2px 0 0", fontSize: 11, color: C.textMuted }}>{loc.areas.length} areas · {loc.type}</p></div>
-            <Icon name="arrow" size={15} color={C.gold} />
-          </div>
-        ))}
-      </div>
     </div>
   );
 };
 
-// ─── SCREEN: Sites & Areas// ─── SCREEN: Sites & Areas (fully user-customized) ───────────────────────────
-const SitesScreen = ({ locations, setLocations, settings, role }) => {
+// ─── SCREEN: Sites & Areas (fully user-customized) ───────────────────────────
+
+const SitesScreen = ({ locations, setLocations, settings, role, refreshCatalog }) => {
   const isManager = role === "manager";
   const [modal, setModal] = useState(null); // null | "add" | loc
   const [confirm, setConfirm] = useState(null);
   const [form, setForm] = useState({ name: "", type: "Restaurant", areas: [] });
   const [areaInput, setAreaInput] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState("");
+  const [deleting, setDeleting] = useState(false);
 
   const suggestions = AREA_SUGGESTIONS[settings.industry] || AREA_SUGGESTIONS.Foodservice;
-  const openAdd = () => { setForm({ name: "", type: settings.industry === "Retail" ? "Store" : "Restaurant", areas: [] }); setModal("add"); };
-  const openEdit = (loc) => { setForm({ name: loc.name, type: loc.type, areas: loc.areas.map(a => ({ ...a })) }); setModal(loc); };
-  const addArea = (n) => { const nm = n.trim(); if (nm && !form.areas.some(a => a.name === nm)) setForm(f => ({ ...f, areas: [...f.areas, { id: uid("ar"), name: nm }] })); setAreaInput(""); };
+  const openAdd = () => { setSaveError(""); setForm({ name: "", type: settings.industry === "Retail" ? "Store" : "Restaurant", areas: [] }); setModal("add"); };
+  const openEdit = (loc) => { setSaveError(""); setForm({ name: loc.name, type: loc.type, areas: loc.areas.map(a => ({ ...a })) }); setModal(loc); };
+  const addArea = (n) => { const nm = n.trim(); if (nm && !form.areas.some(a => a.name === nm)) setForm(f => ({ ...f, areas: [...f.areas, { id: uid("area"), name: nm, countIntervalDays: 7 }] })); setAreaInput(""); };
   const remArea = (id) => setForm(f => ({ ...f, areas: f.areas.filter(a => a.id !== id) }));
+  const setAreaInterval = (id, days) => setForm(f => ({ ...f, areas: f.areas.map(a => a.id === id ? { ...a, countIntervalDays: Math.max(1, Number(days) || 1) } : a) }));
 
-  const save = () => {
-    if (!form.name.trim()) return;
-    if (modal === "add") setLocations(prev => [...prev, { id: uid("loc"), ...form }]);
-    else setLocations(prev => prev.map(l => l.id === modal.id ? { ...l, ...form } : l));
-    setModal(null);
+  const save = async () => {
+    if (!form.name.trim() || saving) return;
+    setSaving(true); setSaveError("");
+    try {
+      const locId = modal === "add" ? uid("loc") : modal.id;
+      await saveLocationToBackend({ id: locId, name: form.name, type: form.type });
+
+      if (modal !== "add") {
+        const removedAreaIds = modal.areas.filter(a => !form.areas.some(fa => fa.id === a.id)).map(a => a.id);
+        for (const areaId of removedAreaIds) await deleteAreaFromBackend(areaId);
+      }
+      if (form.areas.length > 0) await saveAreasToBackend(locId, form.areas);
+
+      await refreshCatalog?.();
+      setModal(null);
+    } catch (err) {
+      setSaveError(err.message || "Failed to save site");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const confirmDelete = async () => {
+    if (!confirm || deleting) return;
+    setDeleting(true);
+    try {
+      await deleteLocationFromBackend(confirm);
+      await refreshCatalog?.();
+      setConfirm(null);
+    } catch (err) {
+      setSaveError(err.message || "Failed to delete site");
+      setConfirm(null);
+    } finally {
+      setDeleting(false);
+    }
   };
 
   const types = settings.industry === "Retail"
@@ -1073,6 +938,12 @@ const SitesScreen = ({ locations, setLocations, settings, role }) => {
         </button>
       </div>
 
+      {saveError && !modal && (
+        <div style={{ padding: "10px 14px", background: C.redBg, border: `1px solid ${C.redBorder}`, borderRadius: 10, marginBottom: 14 }}>
+          <span style={{ fontSize: 12, color: C.red, fontWeight: 600 }}>{saveError}</span>
+        </div>
+      )}
+
       <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
         {locations.map(loc => (
           <div key={loc.id} style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 16, overflow: "hidden", boxShadow: "0 1px 3px rgba(13,27,42,0.05)" }}>
@@ -1087,7 +958,7 @@ const SitesScreen = ({ locations, setLocations, settings, role }) => {
               <p style={{ margin: "0 0 8px", fontSize: 10, color: C.textMuted, fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.08em" }}>Storage Areas ({loc.areas.length})</p>
               <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
                 {loc.areas.map(a => (
-                  <span key={a.id} style={{ fontSize: 11, fontWeight: 600, color: C.navy, background: C.cardAlt, border: `1px solid ${C.border}`, borderRadius: 20, padding: "4px 10px" }}>{a.name}</span>
+                  <span key={a.id} style={{ fontSize: 11, fontWeight: 600, color: C.navy, background: C.cardAlt, border: `1px solid ${C.border}`, borderRadius: 20, padding: "4px 10px" }}>{a.name} · every {a.countIntervalDays || 7}d</span>
                 ))}
                 {loc.areas.length === 0 && <span style={{ fontSize: 11, color: C.textMuted }}>No areas defined</span>}
               </div>
@@ -1109,10 +980,17 @@ const SitesScreen = ({ locations, setLocations, settings, role }) => {
             <FSelect label="Type" value={form.type} onChange={v => setForm(f => ({ ...f, type: v }))} options={types} />
             <div>
               <label style={{ fontSize: 11, fontWeight: 700, color: C.textSub, textTransform: "uppercase", letterSpacing: "0.08em", display: "block", marginBottom: 10 }}>Storage Areas — name them anything</label>
-              <div style={{ display: "flex", flexWrap: "wrap", gap: 6, minHeight: 32, marginBottom: 10 }}>
-                {form.areas.length === 0 && <span style={{ fontSize: 12, color: C.textMuted, padding: "4px 0" }}>Tap a suggestion or type your own</span>}
+              {form.areas.length === 0 && <p style={{ fontSize: 12, color: C.textMuted, margin: "0 0 10px" }}>Tap a suggestion or type your own</p>}
+              <div style={{ display: "flex", flexDirection: "column", gap: 6, marginBottom: 12 }}>
                 {form.areas.map(a => (
-                  <span key={a.id} onClick={() => remArea(a.id)} style={{ fontSize: 12, fontWeight: 600, color: C.navy, background: C.goldDim, border: `1px solid ${C.goldBorder}`, borderRadius: 20, padding: "5px 10px", cursor: "pointer", display: "flex", alignItems: "center", gap: 6 }}>{a.name} <Icon name="close" size={10} color={C.gold} /></span>
+                  <div key={a.id} style={{ display: "flex", alignItems: "center", gap: 8, background: C.goldDim, border: `1px solid ${C.goldBorder}`, borderRadius: 10, padding: "8px 10px" }}>
+                    <span style={{ fontSize: 12, fontWeight: 600, color: C.navy, flex: 1, minWidth: 0, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{a.name}</span>
+                    <span style={{ fontSize: 10, color: C.textMuted, flexShrink: 0 }}>Count every</span>
+                    <input type="number" min={1} value={a.countIntervalDays ?? 7} onChange={e => setAreaInterval(a.id, e.target.value)}
+                      style={{ width: 44, border: `1px solid ${C.borderDark}`, borderRadius: 6, padding: "4px 6px", fontSize: 12, fontWeight: 700, textAlign: "center", outline: "none", background: "#fff" }} />
+                    <span style={{ fontSize: 10, color: C.textMuted, flexShrink: 0 }}>days</span>
+                    <button onClick={() => remArea(a.id)} style={{ background: "none", border: "none", cursor: "pointer", flexShrink: 0, display: "flex" }}><Icon name="close" size={12} color={C.gold} /></button>
+                  </div>
                 ))}
               </div>
               <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 12 }}>
@@ -1126,7 +1004,8 @@ const SitesScreen = ({ locations, setLocations, settings, role }) => {
                 <button onClick={() => addArea(areaInput)} style={{ background: C.goldDim, border: `1px solid ${C.goldBorder}`, color: C.navy, borderRadius: 10, padding: "10px 14px", fontWeight: 700, cursor: "pointer" }}>Add</button>
               </div>
             </div>
-            <PrimaryBtn onClick={save} disabled={!form.name.trim()}>{modal === "add" ? "Create Site" : "Save Changes"}</PrimaryBtn>
+            {saveError && <p style={{ margin: 0, fontSize: 12, color: C.red, fontWeight: 600 }}>{saveError}</p>}
+            <PrimaryBtn onClick={save} disabled={!form.name.trim() || saving}>{saving ? "Saving…" : modal === "add" ? "Create Site" : "Save Changes"}</PrimaryBtn>
           </div>
         </Modal>
       )}
@@ -1135,10 +1014,10 @@ const SitesScreen = ({ locations, setLocations, settings, role }) => {
         <div style={{ position: "fixed", inset: 0, background: "#0d1b2a99", zIndex: 300, display: "flex", alignItems: "center", justifyContent: "center", padding: 24, animation: `iiqBackdropIn 200ms ${EASE}` }}>
           <div style={{ background: C.card, borderRadius: 18, padding: 24, maxWidth: 340, width: "100%", boxShadow: "0 8px 40px rgba(13,27,42,0.3)", animation: `iiqPopIn 220ms ${EASE}` }}>
             <h3 style={{ fontSize: 18, fontWeight: 400, color: C.navy, textAlign: "center", margin: "0 0 8px", fontFamily: "'DM Serif Display', serif" }}>Delete this site?</h3>
-            <p style={{ fontSize: 13, color: C.textSub, textAlign: "center", margin: "0 0 20px", lineHeight: 1.6 }}>Its areas and item assignments will be removed. The global item catalog is not affected.</p>
+            <p style={{ fontSize: 13, color: C.textSub, textAlign: "center", margin: "0 0 20px", lineHeight: 1.6 }}>Its areas, item assignments, and count history will be permanently removed. The global item catalog is not affected.</p>
             <div style={{ display: "flex", gap: 10 }}>
-              <button onClick={() => setConfirm(null)} style={{ flex: 1, background: C.cardAlt, border: `1px solid ${C.border}`, color: C.textSub, borderRadius: 12, padding: 14, fontWeight: 700, cursor: "pointer" }}>Cancel</button>
-              <button onClick={() => { setLocations(prev => prev.filter(l => l.id !== confirm)); setConfirm(null); }} style={{ flex: 1, background: C.red, border: "none", color: "#fff", borderRadius: 12, padding: 14, fontWeight: 800, cursor: "pointer" }}>Delete</button>
+              <button onClick={() => setConfirm(null)} disabled={deleting} style={{ flex: 1, background: C.cardAlt, border: `1px solid ${C.border}`, color: C.textSub, borderRadius: 12, padding: 14, fontWeight: 700, cursor: "pointer" }}>Cancel</button>
+              <button onClick={confirmDelete} disabled={deleting} style={{ flex: 1, background: C.red, border: "none", color: "#fff", borderRadius: 12, padding: 14, fontWeight: 800, cursor: "pointer" }}>{deleting ? "Deleting…" : "Delete"}</button>
             </div>
           </div>
         </div>
@@ -1148,7 +1027,7 @@ const SitesScreen = ({ locations, setLocations, settings, role }) => {
 };
 
 // ─── SCREEN: Catalog (global master + per-area assignments) ──────────────────
-const CatalogScreen = ({ items, setItems, assignments, setAssignments, locations, settings, setSettings, role }) => {
+const CatalogScreen = ({ items, setItems, assignments, setAssignments, locations, settings, setSettings, role, navigate }) => {
   const isManager = role === "manager";
   const [tab, setTab] = useState("master"); // master | assignments
   const [modal, setModal] = useState(null);
@@ -1291,8 +1170,15 @@ const CatalogScreen = ({ items, setItems, assignments, setAssignments, locations
 
   return (
     <div style={{ padding: "24px 16px 100px" }}>
-      <h1 style={{ fontSize: 24, fontWeight: 400, color: C.navy, margin: 0, fontFamily: "'DM Serif Display', serif" }}>Item Catalog</h1>
-      <p style={{ fontSize: 13, color: C.textSub, margin: "4px 0 16px" }}>One global list · assigned to areas with their own pars</p>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 10 }}>
+        <div>
+          <h1 style={{ fontSize: 24, fontWeight: 400, color: C.navy, margin: 0, fontFamily: "'DM Serif Display', serif" }}>Item Catalog</h1>
+          <p style={{ fontSize: 13, color: C.textSub, margin: "4px 0 16px" }}>One global list · assigned to areas with their own pars</p>
+        </div>
+        <button onClick={() => navigate?.("orders")} style={{ flexShrink: 0, background: C.goldDim, border: `1px solid ${C.goldBorder}`, color: C.navy, borderRadius: 10, padding: "8px 12px", fontSize: 11.5, fontWeight: 700, cursor: "pointer", display: "flex", alignItems: "center", gap: 5 }}>
+          <Icon name="order" size={13} color={C.gold} />Orders & Value
+        </button>
+      </div>
 
       {saveError && (
         <div style={{ padding: "10px 14px", background: C.amberBg, border: `1px solid ${C.amberBorder}`, borderRadius: 10, marginBottom: 14, display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8 }}>
@@ -2495,7 +2381,7 @@ const ReviewScreen = ({ navigate, countItems, setCountItems, countMeta, settings
 // order quantities inflated by stock already sitting in areas that weren't part of this count.
 // A true multi-area "full location" mode needs countItems to accumulate across every area
 // counted in a session before this can safely roll up total par vs. total on-hand.
-const OrdersScreen = ({ countItems, items, assignments, role }) => {
+const OrdersScreen = ({ countItems, items, assignments, locations = [], role, settings, setSettings }) => {
   const isManager = role === "manager";
   const [tab, setTab] = useState("reorder");
   const [metrics, setMetrics] = useState(null);
@@ -2504,6 +2390,12 @@ const OrdersScreen = ({ countItems, items, assignments, role }) => {
   const [tagging, setTagging] = useState(null); // the areaItemVariance row being tagged
   const [tagSaving, setTagSaving] = useState(false);
   const [tagNote, setTagNote] = useState("");
+  const [rawMaterial30, setRawMaterial30] = useState(() => {
+    try { return localStorage.getItem("inventoryiq_raw_material_30d") || ""; } catch { return ""; }
+  });
+  const [categoryUsage30, setCategoryUsage30] = useState(() => {
+    try { return JSON.parse(localStorage.getItem("inventoryiq_category_usage_30d") || "{}"); } catch { return {}; }
+  });
 
   useEffect(() => {
     setMetricsLoading(true);
@@ -2560,13 +2452,27 @@ const OrdersScreen = ({ countItems, items, assignments, role }) => {
   const areaVariances = metrics?.areaItemVariances || [];
   const untaggedCount = areaVariances.filter(v => !v.varianceTag).length;
 
+  const saveRawMaterial = (value) => {
+    setRawMaterial30(value);
+    try { localStorage.setItem("inventoryiq_raw_material_30d", value); } catch {}
+  };
+  const saveCategoryUsage = (key, value) => {
+    const next = { ...categoryUsage30, [key]: value };
+    setCategoryUsage30(next);
+    try { localStorage.setItem("inventoryiq_category_usage_30d", JSON.stringify(next)); } catch {}
+  };
+  const usage30 = Number(rawMaterial30 || 0);
+  const dailyUsage = usage30 > 0 ? usage30 / 30 : 0;
+  const daysOnHand = dailyUsage > 0 ? (metrics?.currentValue || 0) / dailyUsage : null;
+  const variancePositive = (metrics?.variance || 0) >= 0;
+
   return (
     <div style={{ padding: "24px 16px 100px" }}>
       <h1 style={{ fontSize: 24, fontWeight: 400, color: C.navy, margin: 0, fontFamily: "'DM Serif Display', serif" }}>Purchase Orders</h1>
-      <p style={{ fontSize: 13, color: C.textSub, margin: "4px 0 16px" }}>Reorder suggestions and variance review, drawn from finalized counts</p>
+      <p style={{ fontSize: 13, color: C.textSub, margin: "4px 0 16px" }}>Reorder suggestions, variance review, and inventory value</p>
 
       <div style={{ display: "flex", background: C.cardAlt, border: `1px solid ${C.border}`, borderRadius: 12, padding: 4, marginBottom: 16 }}>
-        {[["reorder", "Reorder"], ["variance", `Variance Review${untaggedCount > 0 ? ` (${untaggedCount})` : ""}`]].map(([k, label]) => (
+        {[["reorder", "Reorder"], ["variance", `Variance${untaggedCount > 0 ? ` (${untaggedCount})` : ""}`], ["value", "Value"]].map(([k, label]) => (
           <button key={k} onClick={() => setTab(k)} style={{ flex: 1, background: tab === k ? C.navy : "transparent", border: "none", color: tab === k ? "#fff" : C.textSub, borderRadius: 9, padding: "10px", fontWeight: 700, fontSize: 12, cursor: "pointer" }}>{label}</button>
         ))}
       </div>
@@ -2672,6 +2578,181 @@ const OrdersScreen = ({ countItems, items, assignments, role }) => {
                   </div>
                 </div>
               ))}
+            </div>
+          )}
+        </>
+      )}
+
+      {tab === "value" && (
+        <>
+          {metricsError && (
+            <div style={{ padding: "10px 14px", background: C.amberBg, border: `1px solid ${C.amberBorder}`, borderRadius: 10, marginBottom: 14 }}>
+              <span style={{ fontSize: 12, color: C.amber, fontWeight: 600 }}>{metricsError}</span>
+            </div>
+          )}
+          <div style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 16, padding: 16, boxShadow: "0 2px 8px rgba(13,27,42,0.06)", marginBottom: 14 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 12 }}>
+              <div>
+                <div style={{ fontSize: 10, color: C.textMuted, fontWeight: 800, textTransform: "uppercase", letterSpacing: ".09em" }}>Current Inventory Value</div>
+                <div style={{ marginTop: 4, fontSize: 38, lineHeight: 1, color: C.navy, fontFamily: "'DM Serif Display', serif" }}>{metrics ? money(metrics.currentValue) : "—"}</div>
+              </div>
+              {metrics?.previousValue > 0 && <Badge color={variancePositive ? C.amber : C.green}>{variancePositive ? "+" : ""}{money(metrics.variance)} vs prior</Badge>}
+            </div>
+
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginTop: 16 }}>
+              <div style={{ background: C.cardAlt, border: `1px solid ${C.border}`, borderRadius: 12, padding: 12 }}>
+                <div style={{ fontSize: 10, color: C.textMuted, fontWeight: 700, textTransform: "uppercase" }}>Previous Inventory</div>
+                <div style={{ fontSize: 21, fontWeight: 700, color: C.navy, marginTop: 4 }}>{metrics ? money(metrics.previousValue) : "—"}</div>
+                <div style={{ fontSize: 10, color: C.textMuted, marginTop: 2 }}>{metrics?.variancePct != null ? `${metrics.variancePct >= 0 ? "+" : ""}${(metrics.variancePct * 100).toFixed(1)}% change` : "No prior snapshot"}</div>
+              </div>
+              <div style={{ background: daysOnHand != null && daysOnHand > 30 ? C.amberBg : C.greenBg, border: `1px solid ${daysOnHand != null && daysOnHand > 30 ? C.amberBorder : C.greenBorder}`, borderRadius: 12, padding: 12 }}>
+                <div style={{ fontSize: 10, color: C.textMuted, fontWeight: 700, textTransform: "uppercase" }}>Days on Hand</div>
+                <div style={{ fontSize: 21, fontWeight: 700, color: C.navy, marginTop: 4 }}>{daysOnHand == null ? "—" : daysOnHand.toFixed(1)}</div>
+                <div style={{ fontSize: 10, color: C.textMuted, marginTop: 2 }}>{dailyUsage > 0 ? `${money(dailyUsage)}/day avg usage` : "Enter 30-day usage below"}</div>
+              </div>
+            </div>
+
+            <div style={{ marginTop: 16, borderTop: `1px solid ${C.border}`, paddingTop: 14 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10 }}>
+                <div>
+                  <div style={{ fontSize: 11, fontWeight: 800, color: C.navy }}>30-day raw material usage / COGS</div>
+                  <div style={{ fontSize: 10, color: C.textMuted }}>Used to calculate days on hand: inventory ÷ (30-day usage ÷ 30)</div>
+                </div>
+                <div style={{ position: "relative", width: 126, flexShrink: 0 }}>
+                  <span style={{ position: "absolute", left: 10, top: 9, color: C.textMuted, fontWeight: 700 }}>$</span>
+                  <input type="number" inputMode="decimal" value={rawMaterial30} onChange={e => saveRawMaterial(e.target.value)} placeholder="0" style={{ width: "100%", border: `1px solid ${C.borderDark}`, borderRadius: 9, padding: "9px 9px 9px 23px", fontSize: 13, fontWeight: 700, color: C.navy, outline: "none", background: "#fff" }} />
+                </div>
+              </div>
+            </div>
+
+            <div style={{ marginTop: 16 }}>
+              <div style={{ fontSize: 10, color: C.textMuted, fontWeight: 800, textTransform: "uppercase", letterSpacing: ".08em", marginBottom: 2 }}>Inventory Dollar Trend</div>
+              <InventoryTrend snapshots={metrics?.snapshots || []} />
+            </div>
+            {metrics && <div style={{ marginTop: 8, fontSize: 9, color: C.textMuted }}>
+              {metrics.costingBasis === "locked_historical_cost"
+                ? "Historical cost locked: each count is valued at the item cost captured when that inventory was saved."
+                : metrics.costingBasis === "mixed_locked_and_legacy_estimate"
+                  ? `Historical cost locking is active. ${metrics.legacyEstimatedLines || 0} older line${(metrics.legacyEstimatedLines || 0) === 1 ? "" : "s"} predate cost locking and are estimated using current item-master cost.`
+                  : "Legacy valuation: historical counts are using current item-master cost."}
+            </div>}
+          </div>
+
+          {metrics?.activeCycle && (
+            <div style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 14, padding: 15, marginBottom: 14 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                <div>
+                  <div style={{ fontSize: 10, color: C.textMuted, fontWeight: 800, textTransform: "uppercase", letterSpacing: ".08em" }}>Count Cycle</div>
+                  <div style={{ fontSize: 15, fontWeight: 800, color: C.navy, marginTop: 2 }}>{metrics.activeCycle.label || "Current inventory cycle"}</div>
+                </div>
+                <div style={{ textAlign: "right" }}>
+                  <div style={{ fontSize: 20, fontWeight: 800, color: C.gold }}>{metrics.activeCycle.completedAreas}/{metrics.activeCycle.totalAreas}</div>
+                  <div style={{ fontSize: 9, color: C.textMuted }}>areas complete</div>
+                </div>
+              </div>
+              <div style={{ height: 7, background: C.border, borderRadius: 4, overflow: "hidden", marginTop: 10 }}>
+                <div style={{ width: `${Math.round((metrics.activeCycle.progressPct || 0) * 100)}%`, height: "100%", background: C.gold, borderRadius: 4 }} />
+              </div>
+              <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginTop: 10 }}>
+                {(metrics.activeCycle.areas || []).map(a => <Badge key={a.areaId} color={a.complete ? C.green : C.textMuted}>{a.complete ? "✓ " : "○ "}{a.areaName}</Badge>)}
+              </div>
+            </div>
+          )}
+
+          {metrics?.rootCause && (
+            <div style={{ background: C.navy, borderRadius: 14, padding: 16, marginBottom: 14 }}>
+              <div style={{ fontSize: 10, color: C.goldLight, fontWeight: 800, textTransform: "uppercase", letterSpacing: ".09em" }}>Inventory Intelligence</div>
+              <div style={{ marginTop: 5, fontSize: 16, color: "#fff", fontFamily: "'DM Serif Display', serif", lineHeight: 1.3 }}>{metrics.rootCause.headline}</div>
+              <div style={{ marginTop: 7, fontSize: 11, color: "#ffffffb8", lineHeight: 1.55 }}>{metrics.rootCause.narrative}</div>
+              {(metrics.rootCause.drivers || []).length > 0 && <div style={{ marginTop: 12, display: "flex", flexDirection: "column", gap: 6 }}>
+                {metrics.rootCause.drivers.slice(0,5).map(d => (
+                  <div key={d.itemId} style={{ display: "flex", justifyContent: "space-between", gap: 10, padding: "7px 9px", background: "#ffffff0e", borderRadius: 8 }}>
+                    <div style={{ minWidth: 0 }}><div style={{ fontSize: 11, fontWeight: 700, color: "#fff", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{d.name}</div><div style={{ fontSize: 9, color: "#ffffff88" }}>{d.categoryName}</div></div>
+                    <div style={{ fontSize: 12, fontWeight: 800, color: d.variance >= 0 ? C.goldLight : "#8ee3b4", flexShrink: 0 }}>{d.variance >= 0 ? "+" : "−"}{money(Math.abs(d.variance))}</div>
+                  </div>
+                ))}
+              </div>}
+            </div>
+          )}
+
+          {(metrics?.categories || []).length > 0 && (
+            <div style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 14, padding: 15, marginBottom: 14 }}>
+              <div style={{ fontSize: 10, color: C.textMuted, fontWeight: 800, textTransform: "uppercase", letterSpacing: ".08em" }}>Category Inventory & Days on Hand</div>
+              <div style={{ fontSize: 10, color: C.textMuted, marginTop: 3, marginBottom: 10 }}>Enter trailing 30-day usage by category for an accurate category DOH.</div>
+              <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                {metrics.categories.slice(0,10).map(cat => {
+                  const key = cat.categoryId || "uncategorized";
+                  const usage = Number(categoryUsage30[key] || 0);
+                  const doh = usage > 0 ? cat.currentValue / (usage / 30) : null;
+                  return <div key={key} style={{ padding: 10, background: C.cardAlt, border: `1px solid ${C.border}`, borderRadius: 10 }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", gap: 8, alignItems: "center" }}>
+                      <div style={{ minWidth: 0 }}>
+                        <div style={{ fontSize: 12, fontWeight: 800, color: C.navy }}>{cat.categoryName}</div>
+                        <div style={{ fontSize: 10, color: C.textMuted }}>{money(cat.currentValue)} · {cat.variance >= 0 ? "+" : ""}{money(cat.variance)} vs prior</div>
+                      </div>
+                      <div style={{ textAlign: "right", flexShrink: 0 }}>
+                        <div style={{ fontSize: 17, fontWeight: 800, color: doh != null && doh > 30 ? C.amber : C.navy }}>{doh == null ? "—" : doh.toFixed(1)}</div>
+                        <div style={{ fontSize: 9, color: C.textMuted }}>DOH</div>
+                      </div>
+                    </div>
+                    <div style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 7 }}>
+                      <span style={{ fontSize: 9, color: C.textMuted, flex: 1 }}>30-day usage</span>
+                      <span style={{ fontSize: 10, color: C.textMuted }}>$</span>
+                      <input type="number" inputMode="decimal" value={categoryUsage30[key] || ""} onChange={e => saveCategoryUsage(key, e.target.value)} placeholder="0" style={{ width: 88, border: `1px solid ${C.borderDark}`, borderRadius: 7, padding: "6px 7px", fontSize: 11, fontWeight: 700, outline: "none", background: "#fff" }} />
+                    </div>
+                  </div>;
+                })}
+              </div>
+            </div>
+          )}
+
+          {(metrics?.itemVariances || []).length > 0 && (
+            <div style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 14, padding: 15, marginBottom: 14 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
+                <div style={{ fontSize: 10, color: C.textMuted, fontWeight: 800, textTransform: "uppercase", letterSpacing: ".08em" }}>Largest SKU Dollar Variances</div>
+                <Badge color={C.gold}>{Math.min(10, metrics.itemVariances.length)} shown</Badge>
+              </div>
+              {metrics.itemVariances.slice(0,10).map(v => <div key={v.itemId} style={{ display: "grid", gridTemplateColumns: "1fr auto", gap: 8, padding: "8px 0", borderTop: `1px solid ${C.border}` }}>
+                <div style={{ minWidth: 0 }}><div style={{ fontSize: 11, fontWeight: 700, color: C.navy, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{v.name}</div><div style={{ fontSize: 9, color: C.textMuted }}>{money(v.previousValue)} → {money(v.currentValue)}</div></div>
+                <div style={{ fontSize: 12, fontWeight: 800, color: v.variance > 0 ? C.amber : v.variance < 0 ? C.green : C.textMuted }}>{v.variance >= 0 ? "+" : "−"}{money(Math.abs(v.variance))}</div>
+              </div>)}
+            </div>
+          )}
+
+          {metrics?.statusCounts && Object.keys(metrics.statusCounts).length > 0 && (
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(2,1fr)", gap: 8, marginBottom: 14 }}>
+              {[["counted","Counted"],["zero_confirmed","Zero Confirmed"],["not_seen","Not Seen"],["not_counted","Not Counted"],["needs_review","Needs Review"],["partial","Come Back Later"]].filter(([k]) => (metrics.statusCounts[k] || 0) > 0 || ["counted","zero_confirmed","not_seen","not_counted"].includes(k)).map(([k,label]) => <div key={k} style={{ background:C.card,border:`1px solid ${k==="needs_review"&&metrics.statusCounts[k]>0?C.redBorder:k==="partial"&&metrics.statusCounts[k]>0?C.amberBorder:C.border}`,borderRadius:11,padding:11 }}><div style={{ fontSize:18,fontWeight:800,color:C.navy }}>{metrics.statusCounts[k] || 0}</div><div style={{ fontSize:9,color:C.textMuted,textTransform:"uppercase",fontWeight:700 }}>{label}</div></div>)}
+            </div>
+          )}
+
+          {isManager && (metrics?.areaCalibration || []).length > 0 && (
+            <div style={{ background: C.card, border: `1px solid ${C.amberBorder}`, borderRadius: 14, padding: 15, marginBottom: 14 }}>
+              <div style={{ fontSize: 10, color: C.textMuted, fontWeight: 800, textTransform: "uppercase", letterSpacing: ".08em", marginBottom: 10 }}>Review Threshold Suggestions</div>
+              {metrics.areaCalibration.map(a => {
+                const applied = settings?.areaThresholds?.[a.areaId] === a.suggestedThreshold;
+                return (
+                  <div key={a.areaId} style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, padding: "8px 0", borderTop: `1px solid ${C.border}` }}>
+                    <div style={{ minWidth: 0 }}>
+                      <p style={{ margin: 0, fontSize: 12, fontWeight: 700, color: C.navy }}>{a.areaName}</p>
+                      <p style={{ margin: "1px 0 0", fontSize: 10.5, color: C.textMuted }}>{Math.round(a.overrideRate * 100)}% of counted lines needed correction over {a.sampleSize} recent lines</p>
+                    </div>
+                    <button onClick={() => setSettings?.(s => ({ ...s, areaThresholds: { ...s.areaThresholds, [a.areaId]: applied ? undefined : a.suggestedThreshold } }))}
+                      style={{ flexShrink: 0, background: applied ? C.navy : C.goldDim, border: `1px solid ${applied ? C.navy : C.goldBorder}`, color: applied ? "#fff" : C.navy, borderRadius: 8, padding: "7px 10px", fontSize: 11, fontWeight: 700, cursor: "pointer" }}>
+                      {applied ? `Applied ${Math.round(a.suggestedThreshold * 100)}%` : `Raise to ${Math.round(a.suggestedThreshold * 100)}%`}
+                    </button>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+
+          {metrics?.areas?.length > 0 && (
+            <div>
+              <p style={{ fontSize: 11, fontWeight: 700, color: C.textMuted, textTransform: "uppercase", letterSpacing: "0.1em", margin: "0 0 10px" }}>Inventory by Area</p>
+              {metrics.areas.slice(0, 6).map(a => <div key={a.areaId} style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 10, padding: "10px 12px", marginBottom: 7, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                <div><div style={{ fontSize: 12, fontWeight: 700, color: C.navy }}>{a.areaName}</div><div style={{ fontSize: 10, color: C.textMuted }}>{new Date(a.date).toLocaleDateString()}</div></div>
+                <div style={{ textAlign: "right" }}><div style={{ fontSize: 13, fontWeight: 800, color: C.navy }}>{money(a.value)}</div>{a.previousValue > 0 && <div style={{ fontSize: 9, color: a.value <= a.previousValue ? C.green : C.amber }}>{a.value >= a.previousValue ? "+" : ""}{money(a.value - a.previousValue)}</div>}</div>
+              </div>)}
             </div>
           )}
         </>
@@ -3194,6 +3275,7 @@ const AppShell = ({ auth, onSignOut }) => {
   const [items, setItems] = useState([]);
   const [assignments, setAssignments] = useState([]);
   const [stages, setStages] = useState([]);
+  const [recentCounts, setRecentCounts] = useState([]);
   const [countItems, setCountItems] = useState([]);
   const [countMeta, setCountMeta] = useState(null);
   const [catalogState, setCatalogState] = useState("loading"); // loading | ready | error
@@ -3201,9 +3283,9 @@ const AppShell = ({ auth, onSignOut }) => {
 
   const fetchCatalog = () => {
     setCatalogState("loading");
-    loadCatalog()
-      .then(({ locations, items, assignments, stages }) => {
-        setLocations(locations); setItems(items); setAssignments(assignments); setStages(stages);
+    return loadCatalog()
+      .then(({ locations, items, assignments, stages, recentCounts }) => {
+        setLocations(locations); setItems(items); setAssignments(assignments); setStages(stages); setRecentCounts(recentCounts || []);
         setCatalogState("ready");
       })
       .catch(e => { setCatalogError(e.message || "Could not load catalog"); setCatalogState("error"); });
@@ -3228,12 +3310,12 @@ const AppShell = ({ auth, onSignOut }) => {
   }
 
   const screens = {
-    dashboard: <Dashboard locations={locations} items={items} assignments={assignments} navigate={setScreen} settings={settings} setSettings={setSettings} />,
-    sites:     <SitesScreen locations={locations} setLocations={setLocations} settings={settings} role={auth.role} />,
-    catalog:   <CatalogScreen items={items} setItems={setItems} assignments={assignments} setAssignments={setAssignments} locations={locations} settings={settings} setSettings={setSettings} role={auth.role} />,
+    dashboard: <Dashboard locations={locations} navigate={setScreen} recentCounts={recentCounts} />,
+    sites:     <SitesScreen locations={locations} setLocations={setLocations} settings={settings} role={auth.role} refreshCatalog={fetchCatalog} />,
+    catalog:   <CatalogScreen items={items} setItems={setItems} assignments={assignments} setAssignments={setAssignments} locations={locations} settings={settings} setSettings={setSettings} role={auth.role} navigate={setScreen} />,
     capture:   <CaptureScreen locations={locations} items={items} assignments={assignments} stages={stages} setStages={setStages} settings={settings} navigate={setScreen} onComplete={(r, m) => { setCountItems(r); setCountMeta(m); }} />,
     review:    <ReviewScreen navigate={setScreen} countItems={countItems} setCountItems={setCountItems} countMeta={countMeta} settings={settings} items={items} setItems={setItems} assignments={assignments} setAssignments={setAssignments} />,
-    orders:    <OrdersScreen countItems={countItems} items={items} assignments={assignments} role={auth.role} />,
+    orders:    <OrdersScreen countItems={countItems} items={items} assignments={assignments} locations={locations} role={auth.role} settings={settings} setSettings={setSettings} />,
     approvals: <ApprovalsScreen />,
     settings:  <SettingsScreen settings={settings} setSettings={setSettings} auth={auth} onSignOut={onSignOut} />,
   };

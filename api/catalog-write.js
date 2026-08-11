@@ -9,6 +9,10 @@
 // two-role model extends to counters yet -- see the settings.staffCanAddItems toggle in
 // the frontend, which isn't wired to server-side enforcement yet).
 //
+// POST /api/catalog-write   body: { action: "upsert-locations", locations: [...] }
+// POST /api/catalog-write   body: { action: "delete-location", id }
+// POST /api/catalog-write   body: { action: "upsert-areas", locationId, areas: [...] }
+// POST /api/catalog-write   body: { action: "delete-area", id }
 // POST /api/catalog-write   body: { action: "upsert-items", items: [...] }
 // POST /api/catalog-write   body: { action: "upsert-assignments", assignments: [...] }
 // POST /api/catalog-write   body: { action: "delete-assignment", itemId, areaId }
@@ -21,7 +25,69 @@ import crypto from 'crypto';
 
 function newItemId() { return 'item_' + crypto.randomBytes(6).toString('hex'); }
 function newStageId() { return 'stage_' + crypto.randomBytes(6).toString('hex'); }
+function newLocationId() { return 'loc_' + crypto.randomBytes(6).toString('hex'); }
+function newAreaId() { return 'area_' + crypto.randomBytes(6).toString('hex'); }
 function assignmentId(itemId, areaId) { return 'asn_' + crypto.createHash('md5').update(`${itemId}|${areaId}`).digest('hex').slice(0, 12); }
+
+async function handleUpsertLocations(req, res, supabase, auth) {
+  const { locations } = req.body || {};
+  if (!Array.isArray(locations) || locations.length === 0) throw new HttpError(400, 'locations must be a non-empty array');
+
+  const rows = locations.map((l) => ({
+    id: l.id || newLocationId(),
+    organization_id: auth.orgId,
+    name: l.name,
+    type: l.type || null,
+  }));
+
+  const { data, error } = await supabase.from('locations').upsert(rows, { onConflict: 'id' }).select('id, name, type');
+  if (error) throw new HttpError(500, `Failed to save locations: ${error.message}`);
+  res.status(200).json({ locations: data });
+}
+
+async function handleDeleteLocation(req, res, supabase, auth) {
+  const { id } = req.body || {};
+  if (!id) throw new HttpError(400, 'id is required');
+
+  // areas / counts / item_area_assignments / stages under this location cascade-delete at
+  // the DB level -- this genuinely destroys count history for the location, not just the
+  // site/area definitions. The frontend confirms this explicitly before calling here.
+  const { error } = await supabase.from('locations').delete().eq('id', id).eq('organization_id', auth.orgId);
+  if (error) throw new HttpError(500, `Failed to remove location: ${error.message}`);
+  res.status(200).json({ removed: true });
+}
+
+async function handleUpsertAreas(req, res, supabase, auth) {
+  const { locationId, areas } = req.body || {};
+  if (!locationId || !Array.isArray(areas) || areas.length === 0) throw new HttpError(400, 'locationId and a non-empty areas array are required');
+
+  const { data: locCheck, error: locCheckErr } = await supabase.from('locations').select('id').eq('id', locationId).eq('organization_id', auth.orgId).maybeSingle();
+  if (locCheckErr) throw new HttpError(500, 'Failed to verify location ownership');
+  if (!locCheck) throw new HttpError(404, 'Location not found in your organization');
+
+  const rows = areas.map((a) => ({
+    id: a.id || newAreaId(),
+    organization_id: auth.orgId,
+    location_id: locationId,
+    name: a.name,
+    count_interval_days: a.countIntervalDays ?? 7,
+  }));
+
+  const { data, error } = await supabase.from('areas').upsert(rows, { onConflict: 'id' }).select('id, location_id, name, count_interval_days');
+  if (error) throw new HttpError(500, `Failed to save areas: ${error.message}`);
+  res.status(200).json({ areas: data });
+}
+
+async function handleDeleteArea(req, res, supabase, auth) {
+  const { id } = req.body || {};
+  if (!id) throw new HttpError(400, 'id is required');
+
+  // count_items / stages / item_area_assignments under this area cascade-delete at the DB
+  // level -- this destroys count history for the area. The frontend confirms this first.
+  const { error } = await supabase.from('areas').delete().eq('id', id).eq('organization_id', auth.orgId);
+  if (error) throw new HttpError(500, `Failed to remove area: ${error.message}`);
+  res.status(200).json({ removed: true });
+}
 
 async function handleUpsertItems(req, res, supabase, auth) {
   const { items } = req.body || {};
@@ -116,6 +182,10 @@ export default async function handler(req, res) {
     if (action === 'upsert-stages') { await handleUpsertStages(req, res, supabase, auth); return; }
 
     requireManager(auth);
+    if (action === 'upsert-locations') { await handleUpsertLocations(req, res, supabase, auth); return; }
+    if (action === 'delete-location') { await handleDeleteLocation(req, res, supabase, auth); return; }
+    if (action === 'upsert-areas') { await handleUpsertAreas(req, res, supabase, auth); return; }
+    if (action === 'delete-area') { await handleDeleteArea(req, res, supabase, auth); return; }
     if (action === 'upsert-items') { await handleUpsertItems(req, res, supabase, auth); return; }
     if (action === 'upsert-assignments') { await handleUpsertAssignments(req, res, supabase, auth); return; }
     if (action === 'delete-assignment') { await handleDeleteAssignment(req, res, supabase, auth); return; }
