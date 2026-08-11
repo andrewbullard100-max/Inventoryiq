@@ -2297,6 +2297,7 @@ const ReviewScreen = ({ navigate, countItems, setCountItems, countMeta, settings
   const [editing, setEditing] = useState(null);
   const [editVal, setEditVal] = useState("");
   const [addingUnknown, setAddingUnknown] = useState(null); // count item being added to master
+  const [reasonPickerFor, setReasonPickerFor] = useState(null); // key of item awaiting an override reason
 
   const list = countItems || [];
   const confirmed = list.filter(i => i.confirmed).length;
@@ -2304,7 +2305,10 @@ const ReviewScreen = ({ navigate, countItems, setCountItems, countMeta, settings
 
   const update = (key, fn) => setCountItems(prev => prev.map(i => i.key === key ? fn(i) : i));
   const startEdit = (item) => { setEditing(item.key); setEditVal(String(item.override ?? item.aiCount)); };
-  const saveEdit = (key) => { update(key, i => ({ ...i, override: parseInt(editVal) || 0, confirmed: true })); setEditing(null); };
+  // Overriding a count doesn't confirm it immediately -- a one-tap reason picker follows
+  // (see the modal below). Deliberately tiny: a manager mid-review won't fill out a form.
+  const saveEdit = (key) => { update(key, i => ({ ...i, override: parseInt(editVal) || 0 })); setEditing(null); setReasonPickerFor(key); };
+  const applyOverrideReason = (key, reason) => { update(key, i => ({ ...i, overrideReason: reason, confirmed: true })); setReasonPickerFor(null); };
 
   // Add unknown item to global master + assign to this area (respecting staffCanAddItems)
   const [reviewSaveError, setReviewSaveError] = useState("");
@@ -2403,7 +2407,7 @@ const ReviewScreen = ({ navigate, countItems, setCountItems, countMeta, settings
                 {nf && <Badge color={C.textMuted}>📷 Not Seen</Badge>}
                 {needsReview && <Badge color={C.red}>Verify</Badge>}
                 {item.confirmed && <Badge color={C.green}>Confirmed</Badge>}
-                {item.override !== null && <Badge color={C.amber}>Overridden</Badge>}
+                {item.override !== null && <Badge color={C.amber}>Overridden{item.overrideReason ? ` · ${OVERRIDE_REASONS.find(([k]) => k === item.overrideReason)?.[1] || item.overrideReason}` : ""}</Badge>}
               </div>
               <div style={{ marginTop: 10 }}><ConfBar val={item.confidence} threshold={threshold} /></div>
               <div style={{ display: "grid", gridTemplateColumns: item.par !== null ? "1fr 1fr" : "1fr", gap: 8, marginTop: 12 }}>
@@ -2439,6 +2443,22 @@ const ReviewScreen = ({ navigate, countItems, setCountItems, countMeta, settings
           );
         })}
       </div>
+
+      {reasonPickerFor && (() => {
+        const item = list.find(i => i.key === reasonPickerFor);
+        if (!item) return null;
+        return (
+          <Modal title="Why the correction?" onClose={() => applyOverrideReason(reasonPickerFor, null)}>
+            <p style={{ margin: "0 0 14px", fontSize: 12, color: C.textSub, lineHeight: 1.5 }}>{item.name} — this helps flag items that need a reference photo, and areas where the review threshold should be stricter.</p>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+              {OVERRIDE_REASONS.map(([k, label]) => (
+                <button key={k} onClick={() => applyOverrideReason(reasonPickerFor, k)} style={{ background: C.cardAlt, border: `1px solid ${C.border}`, color: C.navy, borderRadius: 10, padding: 12, fontWeight: 700, fontSize: 12.5, cursor: "pointer" }}>{label}</button>
+              ))}
+            </div>
+            <button onClick={() => applyOverrideReason(reasonPickerFor, null)} style={{ width: "100%", marginTop: 10, background: "none", border: "none", color: C.textMuted, fontSize: 12, fontWeight: 600, cursor: "pointer", textAlign: "center" }}>Skip</button>
+          </Modal>
+        );
+      })()}
     </div>
   );
 };
