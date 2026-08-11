@@ -758,7 +758,7 @@ async function updateMemberRole(userId, role) { return orgAction("update-role", 
 async function removeMember(userId) { return orgAction("remove-member", { userId }); }
 
 // ─── SCREEN: Dashboard ────────────────────────────────────────────────────────
-const Dashboard = ({ locations, navigate, isOnline, queuePending = 0, readyForReview = [], onOpenReady, recentCounts = [] }) => {
+const Dashboard = ({ locations, navigate, onSelectArea, isOnline, queuePending = 0, readyForReview = [], onOpenReady, recentCounts = [] }) => {
   const now = Date.now();
 
   // "Due Today": an area is due once its last approved count is older than its own
@@ -847,7 +847,7 @@ const Dashboard = ({ locations, navigate, isOnline, queuePending = 0, readyForRe
         ) : (
           <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
             {dueAreas.map(a => (
-              <div key={a.id} onClick={() => navigate("capture")} style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 12, padding: "12px 14px", display: "flex", alignItems: "center", gap: 10, cursor: "pointer", boxShadow: "0 1px 3px rgba(13,27,42,0.05)" }}>
+              <div key={a.id} onClick={() => onSelectArea(a.locationId, a.id)} style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 12, padding: "12px 14px", display: "flex", alignItems: "center", gap: 10, cursor: "pointer", boxShadow: "0 1px 3px rgba(13,27,42,0.05)" }}>
                 <div style={{ width: 8, height: 8, borderRadius: "50%", background: a.daysSince === Infinity ? C.textMuted : a.daysSince > a.intervalDays * 2 ? C.red : C.amber, flexShrink: 0 }} />
                 <div style={{ flex: 1, minWidth: 0 }}>
                   <p style={{ margin: 0, fontSize: 13, fontWeight: 700, color: C.navy }}>{a.name}</p>
@@ -1769,9 +1769,13 @@ function mergeAndReconcileStageResults(allResults, areaItems) {
   return finalResults;
 }
 
-const CaptureScreen = ({ locations, items, assignments, stages, setStages, settings, navigate, onComplete, isOnline, onQueued }) => {
-  const [locId, setLocId] = useState(locations[0]?.id || "");
-  const [areaId, setAreaId] = useState("");
+const CaptureScreen = ({ locations, items, assignments, stages, setStages, settings, navigate, onComplete, isOnline, onQueued, presetLocationId, presetAreaId, onPresetConsumed }) => {
+  // A tap on a specific "Due Today" card (Dashboard) arrives here as presetLocationId/
+  // presetAreaId, so the area picker below opens already pointed at that area instead
+  // of always defaulting to the first location's first area.
+  const [locId, setLocId] = useState(presetLocationId || locations[0]?.id || "");
+  const [areaId, setAreaId] = useState(presetAreaId || "");
+  useEffect(() => { onPresetConsumed?.(); }, []); // eslint-disable-line react-hooks/exhaustive-deps
   const [phase, setPhase] = useState("ready");
   const [stageList, setStageList] = useState([]); // [{ id, name, images: [{id, thumbDataUrl, name, sizeKB, status, storagePath}] }]
   const [preview, setPreview] = useState(null);
@@ -3493,6 +3497,13 @@ async function flushOfflineQueue(items, assignments, locations) {
 
 const AppShell = ({ auth, onSignOut }) => {
   const [screen, setScreen] = useState("dashboard");
+  // Set when a specific area is chosen from outside Capture itself (e.g. tapping a
+  // "Due Today" card on the Dashboard) so CaptureScreen opens straight into that area
+  // instead of always defaulting to the first location's first area. Cleared once
+  // CaptureScreen has consumed it, so a later plain "Start Count" / bottom-nav tap
+  // into Capture goes back to normal default behavior.
+  const [pendingArea, setPendingArea] = useState(null); // {locationId, areaId} | null
+  const goToArea = (locationId, areaId) => { setPendingArea({ locationId, areaId }); setScreen("capture"); };
   const [settings, setSettings] = useState(DEFAULT_SETTINGS);
   const [locations, setLocations] = useState([]);
   const [items, setItems] = useState([]);
@@ -3581,10 +3592,10 @@ const AppShell = ({ auth, onSignOut }) => {
   }
 
   const screens = {
-    dashboard: <Dashboard locations={locations} navigate={setScreen} recentCounts={recentCounts} isOnline={isOnline} queuePending={queuePending} readyForReview={readyForReview} onOpenReady={openReadyForReview} />,
+    dashboard: <Dashboard locations={locations} navigate={(s) => { setPendingArea(null); setScreen(s); }} onSelectArea={goToArea} recentCounts={recentCounts} isOnline={isOnline} queuePending={queuePending} readyForReview={readyForReview} onOpenReady={openReadyForReview} />,
     sites:     <SitesScreen locations={locations} setLocations={setLocations} settings={settings} role={auth.role} refreshCatalog={fetchCatalog} />,
     catalog:   <CatalogScreen items={items} setItems={setItems} assignments={assignments} setAssignments={setAssignments} locations={locations} settings={settings} setSettings={setSettings} role={auth.role} navigate={setScreen} />,
-    capture:   <CaptureScreen locations={locations} items={items} assignments={assignments} stages={stages} setStages={setStages} settings={settings} navigate={setScreen} onComplete={(r, m) => { setCountItems(r); setCountMeta(m); }} isOnline={isOnline} onQueued={refreshQueuePending} />,
+    capture:   <CaptureScreen locations={locations} items={items} assignments={assignments} stages={stages} setStages={setStages} settings={settings} navigate={setScreen} onComplete={(r, m) => { setCountItems(r); setCountMeta(m); }} isOnline={isOnline} onQueued={refreshQueuePending} presetLocationId={pendingArea?.locationId} presetAreaId={pendingArea?.areaId} onPresetConsumed={() => setPendingArea(null)} />,
     review:    <ReviewScreen navigate={setScreen} countItems={countItems} setCountItems={setCountItems} countMeta={countMeta} settings={settings} items={items} setItems={setItems} assignments={assignments} setAssignments={setAssignments} />,
     orders:    <OrdersScreen countItems={countItems} items={items} assignments={assignments} locations={locations} role={auth.role} settings={settings} setSettings={setSettings} />,
     approvals: <ApprovalsScreen />,
@@ -3614,7 +3625,7 @@ const AppShell = ({ auth, onSignOut }) => {
           {NAV.map((n, i) => {
             const active = i === activeNavIndex;
             return (
-              <button key={n.key} onClick={() => setScreen(n.key)} style={{ flex: 1, background: "none", border: "none", cursor: "pointer", display: "flex", flexDirection: "column", alignItems: "center", gap: 5, padding: "6px 0", position: "relative" }}>
+              <button key={n.key} onClick={() => { setPendingArea(null); setScreen(n.key); }} style={{ flex: 1, background: "none", border: "none", cursor: "pointer", display: "flex", flexDirection: "column", alignItems: "center", gap: 5, padding: "6px 0", position: "relative" }}>
                 <Icon name={n.icon} size={22} color={active ? C.gold : "#ffffff77"} />
                 <span style={{ fontSize: 10, fontWeight: 700, color: active ? C.gold : "#ffffff77", letterSpacing: "0.04em" }}>{n.label}</span>
               </button>
