@@ -1,5 +1,6 @@
 import { useState, useRef, useEffect } from "react";
 import { createClient } from "@supabase/supabase-js";
+import { enqueueCapture, listQueuedCaptures, updateQueuedCapture, removeQueuedCapture, pendingCount } from "./offlineQueue.js";
 
 // ═══ InventoryIQ — FoodSafeIQ family design system (matched to the real app) ═══
 // Navy #0d1b2a · Navy-mid #1F3864 · Gold #C9A84C · Cream #F2F0EB
@@ -1694,7 +1695,66 @@ const BarcodeScannerModal = ({ areaItems, allItems, onClose, onScan }) => {
   );
 };
 
-const CaptureScreen = ({ locations, items, assignments, stages, setStages, settings, navigate, onComplete }) => {
+// Merges cross-stage detections and reconciles against the full area catalog once every
+// stage's results are in. Pure function -- no component state -- so both the live capture
+// flow (doProcess) and the offline-sync flusher (flushOfflineQueue) can share it instead of
+// duplicating this logic.
+//   - an item seen in only one stage counts normally
+//   - an item seen in multiple stages is flagged cross_stage_conflict for manual review
+//     (may be the same stock double-counted, or genuinely stored in two places)
+//   - an item assigned to the area but absent from EVERY stage's results is not_found
+function mergeAndReconcileStageResults(allResults, areaItems) {
+  const byItemId = new Map();
+  const finalResults = [];
+  for (const r of allResults) {
+    if (!r.itemId) { finalResults.push({ ...r, sourceRowIds: r.dbId ? [r.dbId] : [] }); continue; } // unrecognized items never dedupe
+    if (!byItemId.has(r.itemId)) byItemId.set(r.itemId, []);
+    byItemId.get(r.itemId).push(r);
+  }
+  for (const rows of byItemId.values()) {
+    if (rows.length === 1) { finalResults.push({ ...rows[0], sourceRowIds: rows[0].dbId ? [rows[0].dbId] : [] }); continue; }
+    const breakdown = rows.map(r => `${r.stageName} (qty ${r.aiCount})`).join(", ");
+    finalResults.push({
+      ...rows[0],
+      key: uid("ci"),
+      aiCount: rows.reduce((s, r) => s + r.aiCount, 0),
+      confidence: Math.min(...rows.map(r => r.confidence)),
+      matchStatus: "cross_stage_conflict",
+      stageId: null,
+      stageName: rows.map(r => r.stageName).join(", "),
+      notes: `Seen in multiple stages: ${breakdown} — verify total to avoid double-counting`,
+      sourceRowIds: rows.map(r => r.dbId).filter(Boolean),
+    });
+  }
+
+  const detectedIds = new Set(finalResults.filter(r => r.itemId).map(r => r.itemId));
+  for (const item of areaItems) {
+    if (!detectedIds.has(item.id)) {
+      finalResults.push({
+        key: uid("ci"),
+        itemId: item.id,
+        sku: item.sku || item.id,
+        name: item.name,
+        size: item.size || "",
+        aiCount: 0,
+        par: item.par ?? null,
+        confidence: 0,
+        unit: item.unit || "units",
+        price: item.price || 0,
+        notes: "",
+        matchStatus: "not_found",
+        override: null,
+        confirmed: false,
+        stageId: null,
+        stageName: null,
+        sourceRowIds: [],
+      });
+    }
+  }
+  return finalResults;
+}
+
+const CaptureScreen = ({ locations, items, assignments, stages, setStages, settings, navigate, onComplete, isOnline, onQueued }) => {
   const [locId, setLocId] = useState(locations[0]?.id || "");
   const [areaId, setAreaId] = useState("");
   const [phase, setPhase] = useState("ready");
@@ -1797,6 +1857,22 @@ const CaptureScreen = ({ locations, items, assignments, stages, setStages, setti
     const valid = Array.from(files).filter(f => f.type.startsWith("image/"));
     if (valid.length === 0) return;
 
+    // Offline: skip the session/upload calls entirely and hold the photo (with its resized
+    // blob, not just a thumbnail) in memory for the offline queue -- see doProcess below.
+    if (isOnline === false) {
+      for (const file of valid) {
+        const imgId = uid("img");
+        try {
+          const { blob, mediaType, thumbDataUrl } = await processPhotoForCapture(file);
+          const entry = { id: imgId, thumbDataUrl, name: file.name, sizeKB: Math.round(blob.size / 1024), status: "queued-offline", storagePath: null, blob, mediaType };
+          setStageList(prev => prev.map(s => s.id === stageId ? { ...s, images: [...s.images, entry].slice(0, 5) } : s));
+        } catch (e) {
+          setStageList(prev => prev.map(s => s.id === stageId ? { ...s, images: [...s.images, { id: imgId, thumbDataUrl: null, name: file.name, sizeKB: 0, status: "error", error: e.message }].slice(0, 5) } : s));
+        }
+      }
+      return;
+    }
+
     // Lazily start (or resume) the count session on first photo of the whole area capture.
     let cid = countId;
     if (!cid) {
@@ -1838,6 +1914,34 @@ const CaptureScreen = ({ locations, items, assignments, stages, setStages, setti
     setErrorMsg("");
     const activeStages = stageList.filter(s => s.images.length > 0);
     if (activeStages.length === 0 && scannedItems.length === 0) return;
+
+    // Offline: nothing here can reach the backend, so package everything captured so far
+    // (photo blobs + scanned items) into one offline queue entry instead of trying and
+    // failing. AppShell's flushOfflineQueue() replays this once the device is back online.
+    if (isOnline === false) {
+      setPhase("processing"); setProgress(0);
+      try {
+        await enqueueCapture({
+          id: uid("queued"),
+          locationId: loc.id, locationName: loc.name,
+          areaId: area.id, areaName: area.name,
+          stages: activeStages.map(s => ({
+            id: s.id, name: s.name,
+            images: s.images.filter(i => i.blob).map(i => ({ id: i.id, name: i.name, mediaType: i.mediaType, blob: i.blob, sizeKB: i.sizeKB })),
+          })),
+          scannedItems,
+        });
+        onQueued?.();
+        setStageList(prev => prev.map(s => ({ ...s, images: [] })));
+        setScannedItems([]);
+        setProgress(100);
+        setTimeout(() => setPhase("queued"), 300);
+      } catch (e) {
+        setProgress(0);
+        setErrorMsg(e.message || "Could not save this count for offline sync."); setPhase("error");
+      }
+      return;
+    }
 
     // Pure barcode/manual count with no photos: fully local (the catalog is already loaded
     // client-side) except for creating the count session itself, since finalize-count.js
@@ -1928,63 +2032,9 @@ const CaptureScreen = ({ locations, items, assignments, stages, setStages, setti
       const allResults = [...carriedOverResults, ...stageResultsList.flat()];
       setProgress(95);
 
-      // Merge across stages: an item seen in only one stage counts normally. An item seen in
-      // multiple stages gets flagged for manual review instead of auto-summed -- it may be the
-      // same physical stock double-counted, or genuinely be stored in two places. sourceRowIds
-      // tracks exactly which count_items row(s) each merged line came from, so finalize can
-      // apply an override to the right row instead of guessing by itemId.
-      const byItemId = new Map();
-      const finalResults = [];
-      for (const r of allResults) {
-        if (!r.itemId) { finalResults.push({ ...r, sourceRowIds: r.dbId ? [r.dbId] : [] }); continue; } // unrecognized items never dedupe
-        if (!byItemId.has(r.itemId)) byItemId.set(r.itemId, []);
-        byItemId.get(r.itemId).push(r);
-      }
-      for (const rows of byItemId.values()) {
-        if (rows.length === 1) { finalResults.push({ ...rows[0], sourceRowIds: rows[0].dbId ? [rows[0].dbId] : [] }); continue; }
-        const breakdown = rows.map(r => `${r.stageName} (qty ${r.aiCount})`).join(", ");
-        finalResults.push({
-          ...rows[0],
-          key: uid("ci"),
-          aiCount: rows.reduce((s, r) => s + r.aiCount, 0),
-          confidence: Math.min(...rows.map(r => r.confidence)),
-          matchStatus: "cross_stage_conflict",
-          stageId: null,
-          stageName: rows.map(r => r.stageName).join(", "),
-          notes: `Seen in multiple stages: ${breakdown} — verify total to avoid double-counting`,
-          sourceRowIds: rows.map(r => r.dbId).filter(Boolean),
-        });
-      }
-
-      // Reconcile against the full area catalog ONCE, now that every stage has been merged --
-      // not per-stage (that was the old bug: an item absent from a single 5-photo stage isn't
-      // "not found", it might just be in a different stage's photos). Only an item absent from
-      // EVERY stage's results is genuinely not_found for this area. sourceRowIds is empty here
-      // since these rows don't exist in count_items yet -- finalize creates them.
-      const detectedIds = new Set(finalResults.filter(r => r.itemId).map(r => r.itemId));
-      for (const item of areaItems) {
-        if (!detectedIds.has(item.id)) {
-          finalResults.push({
-            key: uid("ci"),
-            itemId: item.id,
-            sku: item.sku || item.id,
-            name: item.name,
-            size: item.size || "",
-            aiCount: 0,
-            par: item.par ?? null,
-            confidence: 0,
-            unit: item.unit || "units",
-            price: item.price || 0,
-            notes: "",
-            matchStatus: "not_found",
-            override: null,
-            confirmed: false,
-            stageId: null,
-            stageName: null,
-            sourceRowIds: [],
-          });
-        }
-      }
+      // Merge across stages, reconcile against the catalog (shared with the offline-sync
+      // flusher -- see mergeAndReconcileStageResults above).
+      const finalResults = mergeAndReconcileStageResults(allResults, areaItems);
 
       // Barcode counts win over AI-inferred counts for the same item -- a scanned code is a
       // direct physical read, not an inference -- so scanned rows replace any AI row for the
@@ -2010,6 +2060,13 @@ const CaptureScreen = ({ locations, items, assignments, stages, setStages, setti
 
       <h1 style={{ fontSize: 24, fontWeight: 400, color: C.navy, margin: 0, fontFamily: "'DM Serif Display', serif" }}>Capture Count</h1>
       <p style={{ fontSize: 13, color: C.textSub, margin: "4px 0 18px" }}>Break the area into stages (shelves, walls, bays) — up to 5 photos each</p>
+
+      {phase === "ready" && isOnline === false && (
+        <div style={{ background: C.navy, borderRadius: 12, padding: "10px 14px", marginBottom: 16, display: "flex", alignItems: "center", gap: 10 }}>
+          <span style={{ width: 8, height: 8, borderRadius: "50%", background: C.gold, flexShrink: 0 }} />
+          <p style={{ margin: 0, fontSize: 12, color: "#fff", fontWeight: 600 }}>Offline — photos and scans are saved on this device and will sync automatically once you're back online.</p>
+        </div>
+      )}
 
       {phase === "ready" && showPrepTips && (
         <div style={{ background: C.goldDim, border: `1px solid ${C.goldBorder}`, borderRadius: 12, padding: "12px 14px", marginBottom: 16, position: "relative" }}>
@@ -2135,6 +2192,9 @@ const CaptureScreen = ({ locations, items, assignments, stages, setStages, setti
                         {img.status === "error" && (
                           <div style={{ position: "absolute", bottom: -4, left: 0, right: 0, textAlign: "center" }}><span style={{ fontSize: 8, color: C.red, fontWeight: 800, background: "#fff", padding: "1px 4px", borderRadius: 4 }}>Failed</span></div>
                         )}
+                        {img.status === "queued-offline" && (
+                          <div style={{ position: "absolute", bottom: -4, left: 0, right: 0, textAlign: "center" }}><span style={{ fontSize: 8, color: C.navy, fontWeight: 800, background: C.goldDim, padding: "1px 4px", borderRadius: 4 }}>Queued</span></div>
+                        )}
                         <button onClick={() => removeImage(s.id, img.id)} style={{ position: "absolute", top: -5, right: -5, width: 20, height: 20, borderRadius: "50%", background: C.red, border: "2px solid #fff", display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer" }}><Icon name="close" size={9} color="#fff" /></button>
                         <div style={{ position: "absolute", top: 3, left: 3, width: 16, height: 16, borderRadius: "50%", background: C.navy, display: "flex", alignItems: "center", justifyContent: "center" }}><span style={{ fontSize: 8, color: C.gold, fontWeight: 800 }}>{idx + 1}</span></div>
                       </div>
@@ -2184,7 +2244,8 @@ const CaptureScreen = ({ locations, items, assignments, stages, setStages, setti
           <PrimaryBtn onClick={doProcess} disabled={!canProcess}>
             <span style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 10 }}>
               <Icon name="ai" size={20} color={canProcess ? C.gold : C.textMuted} />
-              {failedUploadCount > 0 ? `${failedUploadCount} photo${failedUploadCount !== 1 ? "s" : ""} failed to upload`
+              {isOnline === false ? (totalImages + scannedItems.reduce((s, i) => s + i.qty, 0) > 0 ? "Save — Will Sync Automatically" : "Add photos or scan a barcode")
+                : failedUploadCount > 0 ? `${failedUploadCount} photo${failedUploadCount !== 1 ? "s" : ""} failed to upload`
                 : totalImages > 0 ? `Analyse ${totalImages} Photo${totalImages !== 1 ? "s" : ""} Across ${activeStageCount} Stage${activeStageCount !== 1 ? "s" : ""}`
                 : scannedItems.length > 0 ? `Save ${scannedItems.reduce((s, i) => s + i.qty, 0)} Scanned Item${scannedItems.reduce((s, i) => s + i.qty, 0) !== 1 ? "s" : ""}`
                 : "Add photos or scan a barcode"}
@@ -2200,6 +2261,17 @@ const CaptureScreen = ({ locations, items, assignments, stages, setStages, setti
           onClose={() => setScannerOpen(false)}
           onScan={handleBarcodeMatch}
         />
+      )}
+
+      {phase === "queued" && (
+        <div style={{ textAlign: "center", padding: "32px 16px" }}>
+          <div style={{ width: 56, height: 56, borderRadius: "50%", background: C.blueBg, border: `1px solid ${C.blue}44`, display: "flex", alignItems: "center", justifyContent: "center", margin: "0 auto 14px" }}>
+            <Icon name="upload" size={24} color={C.blue} />
+          </div>
+          <p style={{ margin: "0 0 6px", fontSize: 16, fontWeight: 400, color: C.navy, fontFamily: "'DM Serif Display', serif" }}>Saved — Will Sync Automatically</p>
+          <p style={{ margin: "0 0 20px", fontSize: 13, color: C.textSub, lineHeight: 1.6 }}>This count is saved on your device and will upload and analyse automatically once you're back online.</p>
+          <button onClick={() => setPhase("ready")} style={{ background: C.card, border: `1px solid ${C.borderDark}`, color: C.textSub, borderRadius: 12, padding: "12px 20px", fontWeight: 700, fontSize: 13, cursor: "pointer" }}>Count Another Area</button>
+        </div>
       )}
 
       {(phase === "done" || phase === "error") && (
@@ -3028,6 +3100,56 @@ const TeamSection = () => {
 };
 
 // ─── SCREEN: Settings ─────────────────────────────────────────────────────────
+// Wraps the browser's native "Add to Home Screen" flow. Chrome/Edge/Android fire
+// `beforeinstallprompt` and let a page trigger it programmatically; iOS Safari has no such
+// event (Share -> Add to Home Screen is manual there), so this card only renders its button
+// where the programmatic prompt exists and otherwise falls back to written instructions.
+const InstallAppCard = () => {
+  const deferredPromptRef = useRef(null);
+  const [installable, setInstallable] = useState(false);
+  const [installed, setInstalled] = useState(false);
+  const isIOS = typeof navigator !== "undefined" && /iphone|ipad|ipod/i.test(navigator.userAgent);
+  const isStandalone = typeof window !== "undefined" && (window.matchMedia?.("(display-mode: standalone)").matches || window.navigator.standalone);
+
+  useEffect(() => {
+    const onPrompt = (e) => { e.preventDefault(); deferredPromptRef.current = e; setInstallable(true); };
+    const onInstalled = () => { setInstalled(true); setInstallable(false); };
+    window.addEventListener("beforeinstallprompt", onPrompt);
+    window.addEventListener("appinstalled", onInstalled);
+    return () => { window.removeEventListener("beforeinstallprompt", onPrompt); window.removeEventListener("appinstalled", onInstalled); };
+  }, []);
+
+  if (isStandalone || installed) return null;
+
+  const promptInstall = async () => {
+    const evt = deferredPromptRef.current;
+    if (!evt) return;
+    evt.prompt();
+    await evt.userChoice;
+    deferredPromptRef.current = null;
+    setInstallable(false);
+  };
+
+  return (
+    <div style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 14, padding: 16, marginBottom: 16 }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 10 }}>
+        <div style={{ width: 40, height: 40, borderRadius: 10, background: C.goldDim, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}><Icon name="upload" size={18} color={C.gold} /></div>
+        <div>
+          <p style={{ margin: 0, fontSize: 14, fontWeight: 700, color: C.navy }}>Install InventoryIQ</p>
+          <p style={{ margin: "1px 0 0", fontSize: 11, color: C.textMuted }}>Faster launch, full-screen, works offline</p>
+        </div>
+      </div>
+      {installable ? (
+        <button onClick={promptInstall} style={{ width: "100%", background: C.navy, border: "none", color: "#fff", borderRadius: 10, padding: 12, fontWeight: 700, fontSize: 13, cursor: "pointer" }}>Add to Home Screen</button>
+      ) : isIOS ? (
+        <p style={{ margin: 0, fontSize: 11.5, color: C.textSub, lineHeight: 1.6 }}>On iPhone/iPad: tap the Share icon in Safari, then "Add to Home Screen".</p>
+      ) : (
+        <p style={{ margin: 0, fontSize: 11.5, color: C.textSub, lineHeight: 1.6 }}>Open the browser menu and look for "Install app" or "Add to Home Screen".</p>
+      )}
+    </div>
+  );
+};
+
 const SettingsScreen = ({ settings, setSettings, auth, onSignOut }) => {
   const [newUnit, setNewUnit] = useState("");
   const [newVendor, setNewVendor] = useState("");
@@ -3038,6 +3160,8 @@ const SettingsScreen = ({ settings, setSettings, auth, onSignOut }) => {
     <div style={{ padding: "24px 16px 100px" }}>
       <h1 style={{ fontSize: 24, fontWeight: 400, color: C.navy, margin: 0, fontFamily: "'DM Serif Display', serif" }}>Settings</h1>
       <p style={{ fontSize: 13, color: C.textSub, margin: "4px 0 20px" }}>Customize InventoryIQ to how your operation runs</p>
+
+      <InstallAppCard />
 
       <div style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 12, padding: 14, marginBottom: 20, display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10 }}>
         <div style={{ minWidth: 0 }}>
@@ -3268,6 +3392,70 @@ const JoinOrgScreen = ({ email, onJoined, onSignOut }) => {
   );
 };
 
+// ─── Offline queue sync ───────────────────────────────────────────────────────
+// Replays a queued offline capture using the exact same backend calls the live capture flow
+// uses (startCountSession, saveStagesToBackend, uploadPhotoToStorage, analysePhotosViaBackend)
+// -- this is not a separate sync path, just the same one driven from stored blobs instead of
+// a live file input. Stops and leaves the entry queued on the first failure (network blip,
+// still offline, etc.) rather than partially syncing -- it'll cleanly retry whole on the next
+// online event. Returns the finished result (for the "ready for review" list) or null if it
+// couldn't be synced yet.
+async function flushOneQueuedCapture(entry, items, assignments, locations) {
+  const loc = locations.find(l => l.id === entry.locationId);
+  const areaItems = assignments
+    .filter(a => a.locationId === entry.locationId && a.areaId === entry.areaId)
+    .map(a => { const it = items.find(i => i.id === a.itemId); return it ? { ...it, par: a.par } : null; })
+    .filter(Boolean);
+
+  const started = await startCountSession(entry.areaId);
+  const cid = started.countId;
+
+  try {
+    await saveStagesToBackend(entry.areaId, entry.stages.map((s, i) => ({ id: s.id, name: s.name, sortOrder: i })));
+  } catch { /* non-fatal -- stage names just won't persist for next time */ }
+
+  const stageResultsList = await runWithConcurrency(entry.stages, 3, async (s) => {
+    const storagePaths = [];
+    for (const img of s.images) {
+      const path = await uploadPhotoToStorage({ areaId: entry.areaId, stageId: s.id, countId: cid, blob: img.blob, mediaType: img.mediaType });
+      storagePaths.push(path);
+    }
+    if (storagePaths.length === 0) return [];
+    const backendResults = await analysePhotosViaBackend({ storagePaths, areaId: entry.areaId, countId: cid, stageId: s.id, stageName: s.name });
+    const adapted = adaptAnalysisResults(backendResults, areaItems);
+    adapted.forEach(r => { r.stageId = s.id; r.stageName = s.name; });
+    return adapted;
+  });
+
+  const allResults = stageResultsList.flat();
+  const finalResults = mergeAndReconcileStageResults(allResults, areaItems);
+  const mergedResults = mergeScannedIntoResults(finalResults, entry.scannedItems || []);
+  const photoCount = entry.stages.reduce((s, st) => s + st.images.length, 0);
+
+  return {
+    id: entry.id,
+    results: mergedResults,
+    meta: { location: loc?.name || entry.locationName, locationId: entry.locationId, area: entry.areaName, areaId: entry.areaId, photoCount, stageCount: entry.stages.length, countId: cid },
+  };
+}
+
+async function flushOfflineQueue(items, assignments, locations) {
+  const queued = (await listQueuedCaptures()).filter(c => c.status === "pending" || c.status === "syncing");
+  const readyEntries = [];
+  for (const entry of queued) {
+    try {
+      await updateQueuedCapture(entry.id, { status: "syncing" });
+      const ready = await flushOneQueuedCapture(entry, items, assignments, locations);
+      await removeQueuedCapture(entry.id);
+      readyEntries.push(ready);
+    } catch (e) {
+      await updateQueuedCapture(entry.id, { status: "pending", error: e.message });
+      break; // stop on first failure so a flaky connection doesn't process the queue out of order
+    }
+  }
+  return readyEntries;
+}
+
 const AppShell = ({ auth, onSignOut }) => {
   const [screen, setScreen] = useState("dashboard");
   const [settings, setSettings] = useState(DEFAULT_SETTINGS);
@@ -3280,6 +3468,54 @@ const AppShell = ({ auth, onSignOut }) => {
   const [countMeta, setCountMeta] = useState(null);
   const [catalogState, setCatalogState] = useState("loading"); // loading | ready | error
   const [catalogError, setCatalogError] = useState("");
+
+  // ── Connectivity + offline capture queue ──────────────────────────────────
+  const [isOnline, setIsOnline] = useState(typeof navigator === "undefined" ? true : navigator.onLine);
+  const [queuePending, setQueuePending] = useState(0);
+  const [readyForReview, setReadyForReview] = useState(() => {
+    try { return JSON.parse(localStorage.getItem("inventoryiq_ready_for_review") || "[]"); } catch { return []; }
+  });
+
+  const refreshQueuePending = () => { pendingCount().then(setQueuePending).catch(() => {}); };
+
+  const saveReadyForReview = (next) => {
+    setReadyForReview(next);
+    // Only the JSON-safe parts persist (results/meta) -- photo blobs are gone by this point
+    // anyway, everything left is plain data, safe for localStorage.
+    try { localStorage.setItem("inventoryiq_ready_for_review", JSON.stringify(next)); } catch {}
+  };
+
+  const runFlush = () => {
+    flushOfflineQueue(dataRef.current.items, dataRef.current.assignments, dataRef.current.locations)
+      .then(newlyReady => {
+        refreshQueuePending();
+        if (newlyReady.length) saveReadyForReview([...dataRef.current.readyForReview, ...newlyReady]);
+      })
+      .catch(() => {}); // best-effort -- entries stay queued and retry on the next online event
+  };
+
+  // The online-event listener below is registered once on mount, so it would otherwise close
+  // over stale (initial, empty) items/assignments/locations/readyForReview -- this ref keeps
+  // it reading the current values without re-registering the listener on every render.
+  const dataRef = useRef({ items, assignments, locations, readyForReview });
+  useEffect(() => { dataRef.current = { items, assignments, locations, readyForReview }; });
+
+  useEffect(() => {
+    const goOnline = () => { setIsOnline(true); runFlush(); };
+    const goOffline = () => setIsOnline(false);
+    window.addEventListener("online", goOnline);
+    window.addEventListener("offline", goOffline);
+    refreshQueuePending();
+    if (navigator.onLine) runFlush(); // catch anything left queued from a prior session
+    return () => { window.removeEventListener("online", goOnline); window.removeEventListener("offline", goOffline); };
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const openReadyForReview = (entry) => {
+    setCountItems(entry.results);
+    setCountMeta(entry.meta);
+    saveReadyForReview(readyForReview.filter(e => e.id !== entry.id));
+    setScreen("review");
+  };
 
   const fetchCatalog = () => {
     setCatalogState("loading");
@@ -3310,10 +3546,10 @@ const AppShell = ({ auth, onSignOut }) => {
   }
 
   const screens = {
-    dashboard: <Dashboard locations={locations} navigate={setScreen} recentCounts={recentCounts} />,
+    dashboard: <Dashboard locations={locations} navigate={setScreen} recentCounts={recentCounts} isOnline={isOnline} queuePending={queuePending} readyForReview={readyForReview} onOpenReady={openReadyForReview} />,
     sites:     <SitesScreen locations={locations} setLocations={setLocations} settings={settings} role={auth.role} refreshCatalog={fetchCatalog} />,
     catalog:   <CatalogScreen items={items} setItems={setItems} assignments={assignments} setAssignments={setAssignments} locations={locations} settings={settings} setSettings={setSettings} role={auth.role} navigate={setScreen} />,
-    capture:   <CaptureScreen locations={locations} items={items} assignments={assignments} stages={stages} setStages={setStages} settings={settings} navigate={setScreen} onComplete={(r, m) => { setCountItems(r); setCountMeta(m); }} />,
+    capture:   <CaptureScreen locations={locations} items={items} assignments={assignments} stages={stages} setStages={setStages} settings={settings} navigate={setScreen} onComplete={(r, m) => { setCountItems(r); setCountMeta(m); }} isOnline={isOnline} onQueued={refreshQueuePending} />,
     review:    <ReviewScreen navigate={setScreen} countItems={countItems} setCountItems={setCountItems} countMeta={countMeta} settings={settings} items={items} setItems={setItems} assignments={assignments} setAssignments={setAssignments} />,
     orders:    <OrdersScreen countItems={countItems} items={items} assignments={assignments} locations={locations} role={auth.role} settings={settings} setSettings={setSettings} />,
     approvals: <ApprovalsScreen />,
