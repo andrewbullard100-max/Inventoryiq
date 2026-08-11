@@ -1607,6 +1607,150 @@ function processPhotoForCapture(file, { uploadMaxDim = 2200, uploadQuality = 0.8
   });
 }
 
+// ─── Barcode / QR scanning fallback ────────────────────────────────────────
+// Many cases in a walk-in still have a readable UPC/EAN, and reading one is faster and
+// more reliable than asking Claude Vision to recognize a SKU visually. This runs entirely
+// on-device (ZXing, no network call) and matches against the item's SKU or its
+// comma-separated aliases -- the item form already documents that field as accepting
+// "vendor codes, UPC, label text", so no schema change is needed to make barcodes work.
+function findItemByCode(code, candidateItems) {
+  const norm = (s) => String(s || "").trim().toLowerCase();
+  const target = norm(code);
+  if (!target) return null;
+  for (const it of candidateItems) {
+    if (norm(it.sku) === target) return it;
+    const aliases = String(it.aliases || "").split(",").map(norm).filter(Boolean);
+    if (aliases.includes(target)) return it;
+  }
+  return null;
+}
+
+// A barcode scan is ground truth (a human held a specific case up to the camera and got an
+// exact code match) -- it never needs review, unlike a vision-inferred count. Converts the
+// running scan tally into the same count-sheet row shape adaptAnalysisResults produces.
+function scannedItemToResultRow(scanned) {
+  return {
+    key: uid("ci"), itemId: scanned.itemId, dbId: null, sku: scanned.sku || scanned.itemId, name: scanned.name,
+    size: scanned.size || "", aiCount: scanned.qty,
+    par: scanned.par ?? null, confidence: 1,
+    unit: scanned.unit || "units", price: scanned.price || 0,
+    notes: "Counted via barcode scan", matchStatus: "matched",
+    override: null, confirmed: true,
+    stageId: null, stageName: null, sourceRowIds: [],
+  };
+}
+
+function mergeScannedIntoResults(aiResults, scannedItems) {
+  if (!scannedItems.length) return aiResults;
+  const scannedByItemId = new Map(scannedItems.map(s => [s.itemId, s]));
+  const kept = aiResults.filter(r => !scannedByItemId.has(r.itemId));
+  return [...kept, ...scannedItems.map(scannedItemToResultRow)];
+}
+
+const BarcodeScannerModal = ({ areaItems, allItems, onClose, onScan }) => {
+  const videoRef = useRef(null);
+  const readerRef = useRef(null);
+  const controlsRef = useRef(null);
+  const lastRef = useRef({ code: null, at: 0 });
+  const [status, setStatus] = useState("starting"); // starting | scanning | error
+  const [errorMsg, setErrorMsg] = useState("");
+  const [lastResult, setLastResult] = useState(null); // { code, item, foundElsewhere }
+  const [manualCode, setManualCode] = useState("");
+  const [torchOn, setTorchOn] = useState(false);
+  const [torchSupported, setTorchSupported] = useState(false);
+
+  const handleCode = (code) => {
+    const now = Date.now();
+    // Debounce: a video stream re-decodes the same barcode many times a second while it's
+    // in frame -- only accept a given code once per 1.5s so one physical case doesn't
+    // register as ten scans.
+    if (lastRef.current.code === code && now - lastRef.current.at < 1500) return;
+    lastRef.current = { code, at: now };
+
+    const inArea = findItemByCode(code, areaItems);
+    const elsewhere = !inArea ? findItemByCode(code, allItems) : null;
+    if (navigator.vibrate) navigator.vibrate(inArea ? 60 : [40, 60, 40]);
+    setLastResult({ code, item: inArea, foundElsewhere: !!elsewhere && !inArea });
+    if (inArea) onScan(inArea);
+  };
+
+  useEffect(() => {
+    let cancelled = false;
+    // Code-split: ~500KB barcode-decoding library only loads when a counter actually opens
+    // the scanner, not on every page view of a mobile app that's already fighting for signal.
+    import("@zxing/browser").then(({ BrowserMultiFormatReader }) => {
+      if (cancelled) return;
+      const reader = new BrowserMultiFormatReader();
+      readerRef.current = reader;
+      return reader.decodeFromVideoDevice(undefined, videoRef.current, (result) => {
+        if (result && !cancelled) handleCode(result.getText());
+      });
+    }).then(controls => {
+      if (!controls) return;
+      if (cancelled) { controls.stop(); return; }
+      controlsRef.current = controls;
+      setStatus("scanning");
+      try {
+        const track = videoRef.current?.srcObject?.getVideoTracks?.()[0];
+        const caps = track?.getCapabilities?.();
+        if (caps && "torch" in caps) setTorchSupported(true);
+      } catch { /* torch feature-detection is best-effort */ }
+    }).catch(e => {
+      if (!cancelled) { setStatus("error"); setErrorMsg(e.message || "Could not access the camera."); }
+    });
+    return () => { cancelled = true; controlsRef.current?.stop(); };
+  }, []);
+
+  const toggleTorch = async () => {
+    try {
+      const track = videoRef.current?.srcObject?.getVideoTracks?.()[0];
+      await track.applyConstraints({ advanced: [{ torch: !torchOn }] });
+      setTorchOn(v => !v);
+    } catch { /* torch not actually controllable on this device */ }
+  };
+
+  const submitManual = () => { if (manualCode.trim()) { handleCode(manualCode.trim()); setManualCode(""); } };
+
+  return (
+    <div style={{ position: "fixed", inset: 0, background: C.navy, zIndex: 500, display: "flex", flexDirection: "column" }}>
+      <div style={{ position: "relative", flex: 1, minHeight: 0, background: "#000", overflow: "hidden" }}>
+        <video ref={videoRef} style={{ width: "100%", height: "100%", objectFit: "cover" }} muted playsInline />
+        {status === "scanning" && (
+          <div style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", pointerEvents: "none" }}>
+            <div style={{ width: "72%", maxWidth: 320, aspectRatio: "2/1", border: `2px solid ${C.gold}`, borderRadius: 14, boxShadow: "0 0 0 2000px rgba(0,0,0,0.35)" }} />
+          </div>
+        )}
+        {status === "error" && (
+          <div style={{ position: "absolute", inset: 0, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", padding: 24, textAlign: "center", gap: 10 }}>
+            <p style={{ color: "#fff", fontWeight: 700, fontSize: 14 }}>Camera unavailable</p>
+            <p style={{ color: "#ffffffaa", fontSize: 12 }}>{errorMsg} You can still enter a code manually below.</p>
+          </div>
+        )}
+        <button onClick={onClose} style={{ position: "absolute", top: 16, right: 16, width: 36, height: 36, borderRadius: "50%", background: "#00000088", border: "none", display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer" }}><Icon name="close" size={18} color="#fff" /></button>
+        {torchSupported && (
+          <button onClick={toggleTorch} style={{ position: "absolute", top: 16, left: 16, width: 36, height: 36, borderRadius: "50%", background: torchOn ? C.gold : "#00000088", border: "none", display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer" }}><Icon name="ai" size={16} color={torchOn ? C.navy : "#fff"} /></button>
+        )}
+        {lastResult && (
+          <div style={{ position: "absolute", bottom: 0, left: 0, right: 0, padding: 14, background: lastResult.item ? "rgba(22,163,74,0.92)" : "rgba(192,57,43,0.92)" }}>
+            <p style={{ margin: 0, color: "#fff", fontWeight: 800, fontSize: 13 }}>{lastResult.item ? `✓ ${lastResult.item.name}` : "Not in this area's catalog"}</p>
+            <p style={{ margin: "2px 0 0", color: "#ffffffdd", fontSize: 11 }}>
+              {lastResult.item ? `Code ${lastResult.code} · added to count` : lastResult.foundElsewhere ? `Code ${lastResult.code} matches a catalog item not assigned here.` : `Code ${lastResult.code} doesn't match any catalog item.`}
+            </p>
+          </div>
+        )}
+      </div>
+      <div style={{ padding: "14px 16px 24px", background: C.navy }}>
+        <p style={{ margin: "0 0 8px", fontSize: 11, color: "#ffffff88", textAlign: "center" }}>Keep scanning — each match adds one unit to the count</p>
+        <div style={{ display: "flex", gap: 8 }}>
+          <input value={manualCode} onChange={e => setManualCode(e.target.value)} onKeyDown={e => e.key === "Enter" && submitManual()} placeholder="Or type a barcode / SKU…" style={{ flex: 1, background: "#ffffff14", border: "1px solid #ffffff33", borderRadius: 10, padding: "11px 14px", color: "#fff", fontSize: 13, outline: "none" }} />
+          <button onClick={submitManual} style={{ background: C.gold, border: "none", color: C.navy, borderRadius: 10, padding: "0 18px", fontWeight: 800, fontSize: 13, cursor: "pointer" }}>Add</button>
+        </div>
+        <button onClick={onClose} style={{ width: "100%", marginTop: 10, background: "#ffffff14", border: "1px solid #ffffff33", color: "#fff", borderRadius: 10, padding: 12, fontWeight: 700, fontSize: 13, cursor: "pointer" }}>Done Scanning</button>
+      </div>
+    </div>
+  );
+};
+
 const CaptureScreen = ({ locations, items, assignments, stages, setStages, settings, navigate, onComplete }) => {
   const [locId, setLocId] = useState(locations[0]?.id || "");
   const [areaId, setAreaId] = useState("");
@@ -1630,6 +1774,8 @@ const CaptureScreen = ({ locations, items, assignments, stages, setStages, setti
   const [activeElsewhere, setActiveElsewhere] = useState(null); // { startedAt } | null -- another device is already counting this area
   const [collision, setCollision] = useState(null); // { startedAt, countId } | null -- surfaced when THIS device tries to start and loses the race
   const uploadPromisesRef = useRef({}); // imgId -> Promise<storagePath>
+  const [scannedItems, setScannedItems] = useState([]); // [{itemId, sku, name, size, unit, par, price, qty}]
+  const [scannerOpen, setScannerOpen] = useState(false);
 
   const loc = locations.find(l => l.id === locId) || locations[0];
   const areas = loc?.areas || [];
@@ -1638,7 +1784,18 @@ const CaptureScreen = ({ locations, items, assignments, stages, setStages, setti
   const activeStageCount = stageList.filter(s => s.images.length > 0).length;
   const uploadingCount = stageList.reduce((s, st) => s + st.images.filter(i => i.status === "uploading").length, 0);
   const failedUploadCount = stageList.reduce((s, st) => s + st.images.filter(i => i.status === "error").length, 0);
-  const canProcess = totalImages > 0 && phase === "ready" && !!area && failedUploadCount === 0;
+  const canProcess = (totalImages > 0 || scannedItems.length > 0) && phase === "ready" && !!area && failedUploadCount === 0;
+
+  const handleBarcodeMatch = (item) => {
+    setScannedItems(prev => {
+      const existing = prev.find(s => s.itemId === item.id);
+      if (existing) return prev.map(s => s.itemId === item.id ? { ...s, qty: s.qty + 1 } : s);
+      return [...prev, { itemId: item.id, sku: item.sku, name: item.name, size: item.size, unit: item.unit, par: item.par, price: item.price, qty: 1 }];
+    });
+  };
+  const adjustScanned = (itemId, delta) => setScannedItems(prev => prev
+    .map(s => s.itemId === itemId ? { ...s, qty: s.qty + delta } : s)
+    .filter(s => s.qty > 0));
 
   useEffect(() => {
     if (!area) { setLastCount(null); return; }
@@ -1651,7 +1808,7 @@ const CaptureScreen = ({ locations, items, assignments, stages, setStages, setti
   // Also check for an in-progress count left over from a dropped connection / closed tab, so a
   // several-hundred-photo count doesn't have to restart from zero after an interruption.
   useEffect(() => {
-    setCountId(null); setCompletedStageIds(new Set()); setResumeBanner(null); setResumedResults([]); setActiveElsewhere(null); setCollision(null); uploadPromisesRef.current = {};
+    setCountId(null); setCompletedStageIds(new Set()); setResumeBanner(null); setResumedResults([]); setActiveElsewhere(null); setCollision(null); uploadPromisesRef.current = {}; setScannedItems([]);
     if (!area) { setStageList([]); return; }
     const persisted = stages.filter(s => s.areaId === area.id).sort((a, b) => a.sortOrder - b.sortOrder);
     setStageList(persisted.length > 0
@@ -1736,7 +1893,29 @@ const CaptureScreen = ({ locations, items, assignments, stages, setStages, setti
   const doProcess = async () => {
     setErrorMsg("");
     const activeStages = stageList.filter(s => s.images.length > 0);
-    if (activeStages.length === 0) return;
+    if (activeStages.length === 0 && scannedItems.length === 0) return;
+
+    // Pure barcode/manual count with no photos: fully local (the catalog is already loaded
+    // client-side) except for creating the count session itself, since finalize-count.js
+    // requires an existing in_progress session to reconcile against.
+    if (activeStages.length === 0) {
+      setPhase("processing"); setProgress(0);
+      try {
+        let cid = countId;
+        if (!cid) {
+          try { const started = await startCountSession(area.id); cid = started.countId; setCountId(cid); }
+          catch (e) { if (e.collision) { setCollision(e.collision); setPhase("ready"); setProgress(0); return; } throw e; }
+        }
+        const results = scannedItems.map(scannedItemToResultRow);
+        setProgress(100); setResultCount(results.length); setPhotoCount(0);
+        onComplete(results, { location: loc.name, locationId: loc.id, area: area.name, areaId: area.id, photoCount: 0, stageCount: 0, countId: cid });
+        setTimeout(() => setPhase("done"), 400);
+      } catch (e) {
+        setProgress(0);
+        setErrorMsg(e.message || "Could not save the scanned counts."); setPhase("error");
+      }
+      return;
+    }
 
     if (failedUploadCount > 0) {
       setErrorMsg(`${failedUploadCount} photo(s) failed to upload. Remove them (or re-add) before analyzing.`);
@@ -1863,8 +2042,13 @@ const CaptureScreen = ({ locations, items, assignments, stages, setStages, setti
         }
       }
 
-      setProgress(100); setResultCount(finalResults.length);
-      onComplete(finalResults, { location: loc.name, locationId: loc.id, area: area.name, areaId: area.id, photoCount: totalPhotos, stageCount: activeStages.length, countId: cid });
+      // Barcode counts win over AI-inferred counts for the same item -- a scanned code is a
+      // direct physical read, not an inference -- so scanned rows replace any AI row for the
+      // same itemId; anything AI found that wasn't also scanned is left untouched.
+      const mergedResults = mergeScannedIntoResults(finalResults, scannedItems);
+
+      setProgress(100); setResultCount(mergedResults.length);
+      onComplete(mergedResults, { location: loc.name, locationId: loc.id, area: area.name, areaId: area.id, photoCount: totalPhotos, stageCount: activeStages.length, countId: cid });
       setTimeout(() => setPhase("done"), 400);
     } catch (e) {
       setProgress(0);
@@ -2015,9 +2199,30 @@ const CaptureScreen = ({ locations, items, assignments, stages, setStages, setti
             ))}
           </div>
 
-          <button onClick={addStage} style={{ width: "100%", background: C.cardAlt, border: `1px dashed ${C.borderDark}`, color: C.textSub, borderRadius: 12, padding: 12, fontWeight: 700, fontSize: 13, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", gap: 6, marginBottom: 18 }}>
+          <button onClick={addStage} style={{ width: "100%", background: C.cardAlt, border: `1px dashed ${C.borderDark}`, color: C.textSub, borderRadius: 12, padding: 12, fontWeight: 700, fontSize: 13, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", gap: 6, marginBottom: 12 }}>
             <Icon name="plus" size={15} color={C.textSub} />Add Stage
           </button>
+
+          {/* Barcode scan fallback: a direct code read is ground truth and never needs
+              review, unlike a vision-inferred count -- see findItemByCode/BarcodeScannerModal. */}
+          <button onClick={() => setScannerOpen(true)} disabled={!area} style={{ width: "100%", background: C.navy, border: "none", color: "#fff", borderRadius: 12, padding: 13, fontWeight: 700, fontSize: 13, cursor: area ? "pointer" : "not-allowed", display: "flex", alignItems: "center", justifyContent: "center", gap: 8, marginBottom: scannedItems.length > 0 ? 10 : 18, opacity: area ? 1 : 0.5 }}>
+            <Icon name="ai" size={15} color={C.gold} />Scan Barcode{scannedItems.length > 0 ? ` (${scannedItems.reduce((s, i) => s + i.qty, 0)} scanned)` : ""}
+          </button>
+
+          {scannedItems.length > 0 && (
+            <div style={{ display: "flex", flexDirection: "column", gap: 6, marginBottom: 18 }}>
+              {scannedItems.map(s => (
+                <div key={s.itemId} style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, background: C.card, border: `1px solid ${C.border}`, borderRadius: 10, padding: "8px 10px" }}>
+                  <p style={{ margin: 0, fontSize: 12, fontWeight: 700, color: C.navy, flex: 1, minWidth: 0, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{s.name}</p>
+                  <div style={{ display: "flex", alignItems: "center", gap: 8, flexShrink: 0 }}>
+                    <button onClick={() => adjustScanned(s.itemId, -1)} style={{ width: 22, height: 22, borderRadius: 6, background: C.cardAlt, border: `1px solid ${C.borderDark}`, cursor: "pointer", fontWeight: 800, color: C.navy }}>−</button>
+                    <span style={{ fontSize: 12, fontWeight: 800, color: C.navy, minWidth: 16, textAlign: "center" }}>{s.qty}</span>
+                    <button onClick={() => adjustScanned(s.itemId, 1)} style={{ width: 22, height: 22, borderRadius: 6, background: C.cardAlt, border: `1px solid ${C.borderDark}`, cursor: "pointer", fontWeight: 800, color: C.navy }}>+</button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
 
           {uploadingCount > 0 && failedUploadCount === 0 && (
             <p style={{ margin: "0 0 10px", fontSize: 11, color: C.textSub, textAlign: "center" }}>Uploading {uploadingCount} photo{uploadingCount !== 1 ? "s" : ""} in the background — you can keep capturing</p>
@@ -2025,10 +2230,22 @@ const CaptureScreen = ({ locations, items, assignments, stages, setStages, setti
           <PrimaryBtn onClick={doProcess} disabled={!canProcess}>
             <span style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 10 }}>
               <Icon name="ai" size={20} color={canProcess ? C.gold : C.textMuted} />
-              {failedUploadCount > 0 ? `${failedUploadCount} photo${failedUploadCount !== 1 ? "s" : ""} failed to upload` : canProcess ? `Analyse ${totalImages} Photo${totalImages !== 1 ? "s" : ""} Across ${activeStageCount} Stage${activeStageCount !== 1 ? "s" : ""}` : "Add photos to continue"}
+              {failedUploadCount > 0 ? `${failedUploadCount} photo${failedUploadCount !== 1 ? "s" : ""} failed to upload`
+                : totalImages > 0 ? `Analyse ${totalImages} Photo${totalImages !== 1 ? "s" : ""} Across ${activeStageCount} Stage${activeStageCount !== 1 ? "s" : ""}`
+                : scannedItems.length > 0 ? `Save ${scannedItems.reduce((s, i) => s + i.qty, 0)} Scanned Item${scannedItems.reduce((s, i) => s + i.qty, 0) !== 1 ? "s" : ""}`
+                : "Add photos or scan a barcode"}
             </span>
           </PrimaryBtn>
         </>
+      )}
+
+      {scannerOpen && (
+        <BarcodeScannerModal
+          areaItems={areaItems}
+          allItems={items}
+          onClose={() => setScannerOpen(false)}
+          onScan={handleBarcodeMatch}
+        />
       )}
 
       {(phase === "done" || phase === "error") && (
