@@ -1452,6 +1452,7 @@ const CatalogScreen = ({ items, setItems, assignments, setAssignments, locations
             </div>
             <FSelect label="Vendor" value={form.vendor} onChange={v => setForm(f => ({ ...f, vendor: v }))} options={["", ...settings.vendors]} />
             <FInput label="Aliases (comma-separated)" value={form.aliases} onChange={v => setForm(f => ({ ...f, aliases: v }))} placeholder="vendor codes, UPC, label text" />
+            <p style={{ margin: "-6px 0 0", fontSize: 10.5, color: C.textMuted, lineHeight: 1.5 }}>For Sysco items, use the barcode from the case's yellow pic sticker (not the printed case label) — it scans more reliably than other case markings.</p>
             <PrimaryBtn onClick={saveItem} disabled={!form.name.trim() || !form.sku.trim()}>{modal === "add" ? "Add to Master" : "Save Changes"}</PrimaryBtn>
           </div>
         </Modal>
@@ -1796,6 +1797,7 @@ const BarcodeScannerModal = ({ areaItems, allItems, onClose, onScan }) => {
       </div>
       <div style={{ padding: "14px 16px 24px", background: C.navy }}>
         <p style={{ margin: "0 0 8px", fontSize: 11, color: "#ffffff88", textAlign: "center" }}>Keep scanning — each match adds one unit to the count</p>
+        <p style={{ margin: "0 0 8px", fontSize: 10.5, color: "#ffffff66", textAlign: "center" }}>Sysco cases: use the yellow pic sticker barcode, not the printed case label</p>
         <div style={{ display: "flex", gap: 8 }}>
           <input value={manualCode} onChange={e => setManualCode(e.target.value)} onKeyDown={e => e.key === "Enter" && submitManual()} placeholder="Or type a barcode / SKU…" style={{ flex: 1, background: "#ffffff14", border: "1px solid #ffffff33", borderRadius: 10, padding: "11px 14px", color: "#fff", fontSize: 13, outline: "none" }} />
           <button onClick={submitManual} style={{ background: C.gold, border: "none", color: C.navy, borderRadius: 10, padding: "0 18px", fontWeight: 800, fontSize: 13, cursor: "pointer" }}>Add</button>
@@ -1831,6 +1833,7 @@ const CaptureScreen = ({ locations, items, assignments, stages, setStages, setti
   const uploadPromisesRef = useRef({}); // imgId -> Promise<storagePath>
   const [scannedItems, setScannedItems] = useState([]); // [{itemId, sku, name, size, unit, par, price, qty}]
   const [scannerOpen, setScannerOpen] = useState(false);
+  const [showPrepTips, setShowPrepTips] = useState(true);
 
   const loc = locations.find(l => l.id === locId) || locations[0];
   const areas = loc?.areas || [];
@@ -2121,6 +2124,16 @@ const CaptureScreen = ({ locations, items, assignments, stages, setStages, setti
 
       <h1 style={{ fontSize: 24, fontWeight: 400, color: C.navy, margin: 0, fontFamily: "'DM Serif Display', serif" }}>Capture Count</h1>
       <p style={{ fontSize: 13, color: C.textSub, margin: "4px 0 18px" }}>Break the area into stages (shelves, walls, bays) — up to 5 photos each</p>
+
+      {phase === "ready" && showPrepTips && (
+        <div style={{ background: C.goldDim, border: `1px solid ${C.goldBorder}`, borderRadius: 12, padding: "12px 14px", marginBottom: 16, position: "relative" }}>
+          <button onClick={() => setShowPrepTips(false)} style={{ position: "absolute", top: 8, right: 8, width: 22, height: 22, borderRadius: "50%", background: "none", border: "none", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}><Icon name="close" size={12} color={C.navy} /></button>
+          <p style={{ margin: "0 20px 4px 0", fontSize: 11, fontWeight: 800, color: C.navy, textTransform: "uppercase", letterSpacing: ".06em" }}>Before you start</p>
+          <p style={{ margin: 0, fontSize: 12, color: C.navy, lineHeight: 1.6 }}>
+            Turn cases so labels face out and pic stickers/barcodes are visible, and square up items on the shelf — both the photo count and barcode scan work better on a tidy, well-lit shelf than a jumbled one.
+          </p>
+        </div>
+      )}
 
       {phase === "ready" && (
         <div style={{ display: "flex", flexDirection: "column", gap: 12, marginBottom: 18 }}>
