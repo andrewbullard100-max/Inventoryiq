@@ -691,6 +691,20 @@ async function tagVariance(countItemId, tag, note) {
 
 const money = (n) => new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", maximumFractionDigits: 0 }).format(Number(n || 0));
 
+const csvCell = (v) => {
+  const s = v === null || v === undefined ? "" : String(v);
+  return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+};
+const downloadCsv = (filename, headers, rows) => {
+  const csv = [headers, ...rows].map(row => row.map(csvCell).join(",")).join("\r\n");
+  const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url; a.download = filename;
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+};
+
 const InventoryTrend = ({ snapshots }) => {
   const pts = [...(snapshots || [])].reverse();
   if (pts.length < 2) return <div style={{ fontSize: 12, color: C.textMuted, padding: "18px 0 4px" }}>Complete at least two inventory cycles to build a dollar trend.</div>;
@@ -2602,6 +2616,7 @@ const OrdersScreen = ({ countItems, items, assignments, locations = [], role, se
   const [tagging, setTagging] = useState(null); // the areaItemVariance row being tagged
   const [tagSaving, setTagSaving] = useState(false);
   const [tagNote, setTagNote] = useState("");
+  const [areaDetail, setAreaDetail] = useState(null); // the area (from metrics.areas) whose itemized count is open
   const [rawMaterial30, setRawMaterial30] = useState(() => {
     try { return localStorage.getItem("inventoryiq_raw_material_30d") || ""; } catch { return ""; }
   });
@@ -2677,6 +2692,24 @@ const OrdersScreen = ({ countItems, items, assignments, locations = [], role, se
   const dailyUsage = usage30 > 0 ? usage30 / 30 : 0;
   const daysOnHand = dailyUsage > 0 ? (metrics?.currentValue || 0) / dailyUsage : null;
   const variancePositive = (metrics?.variance || 0) >= 0;
+
+  const locationBreakdown = (() => {
+    const areas = metrics?.areas || [];
+    if (!areas.length) return [];
+    const byLoc = new Map();
+    for (const a of areas) {
+      const cur = byLoc.get(a.locationId) || { locationId: a.locationId, value: 0, previousValue: 0, areaCount: 0, countedAreas: 0, latestDate: null };
+      cur.value += a.value;
+      cur.previousValue += a.previousValue;
+      cur.areaCount += 1;
+      if (a.status !== "not_started") cur.countedAreas += 1;
+      if (a.date && (!cur.latestDate || new Date(a.date) > new Date(cur.latestDate))) cur.latestDate = a.date;
+      byLoc.set(a.locationId, cur);
+    }
+    return [...byLoc.values()]
+      .map(l => ({ ...l, locationName: locations.find(loc => loc.id === l.locationId)?.name || "Unknown location", variance: l.value - l.previousValue }))
+      .sort((a, b) => b.value - a.value);
+  })();
 
   return (
     <div style={{ padding: "24px 16px 100px" }}>
@@ -2958,11 +2991,36 @@ const OrdersScreen = ({ countItems, items, assignments, locations = [], role, se
             </div>
           )}
 
+    {locationBreakdown.length > 0 && (
+            <div style={{ marginBottom: 18 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
+                <p style={{ fontSize: 11, fontWeight: 700, color: C.textMuted, textTransform: "uppercase", letterSpacing: "0.1em", margin: 0 }}>Inventory Value by Location</p>
+                <button onClick={() => downloadCsv(
+                  `inventory-value-by-location-${new Date().toISOString().slice(0, 10)}.csv`,
+                  ["Location", "Total Value", "Previous Value", "Variance", "Areas Counted", "Total Areas", "Last Count Date"],
+                  locationBreakdown.map(l => [l.locationName, l.value.toFixed(2), l.previousValue.toFixed(2), l.variance.toFixed(2), l.countedAreas, l.areaCount, l.latestDate ? new Date(l.latestDate).toLocaleDateString() : ""])
+                )} style={{ background: C.goldDim, border: `1px solid ${C.goldBorder}`, color: C.navy, borderRadius: 8, padding: "6px 10px", fontSize: 11, fontWeight: 700, cursor: "pointer" }}>Export CSV</button>
+              </div>
+              {locationBreakdown.map(l => (
+                <div key={l.locationId} style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 10, padding: "12px 14px", marginBottom: 7, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                  <div>
+                    <div style={{ fontSize: 13, fontWeight: 800, color: C.navy }}>{l.locationName}</div>
+                    <div style={{ fontSize: 10, color: C.textMuted }}>{l.countedAreas}/{l.areaCount} areas counted{l.latestDate ? ` · ${new Date(l.latestDate).toLocaleDateString()}` : ""}</div>
+                  </div>
+                  <div style={{ textAlign: "right" }}>
+                    <div style={{ fontSize: 15, fontWeight: 800, color: C.navy }}>{money(l.value)}</div>
+                    {l.previousValue > 0 && <div style={{ fontSize: 9, color: l.value <= l.previousValue ? C.green : C.amber }}>{l.variance >= 0 ? "+" : ""}{money(l.variance)}</div>}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+
           {metrics?.areas?.length > 0 && (
             <div>
               <p style={{ fontSize: 11, fontWeight: 700, color: C.textMuted, textTransform: "uppercase", letterSpacing: "0.1em", margin: "0 0 10px" }}>Inventory by Area</p>
-              {metrics.areas.slice(0, 6).map(a => <div key={a.areaId} style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 10, padding: "10px 12px", marginBottom: 7, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                <div><div style={{ fontSize: 12, fontWeight: 700, color: C.navy }}>{a.areaName}</div><div style={{ fontSize: 10, color: C.textMuted }}>{new Date(a.date).toLocaleDateString()}</div></div>
+              {metrics.areas.slice(0, 6).map(a => <div key={a.areaId} onClick={() => a.date && setAreaDetail(a)} style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 10, padding: "10px 12px", marginBottom: 7, display: "flex", justifyContent: "space-between", alignItems: "center", cursor: a.date ? "pointer" : "default" }}>
+                <div><div style={{ fontSize: 12, fontWeight: 700, color: C.navy }}>{a.areaName}</div><div style={{ fontSize: 10, color: C.textMuted }}>{a.date ? new Date(a.date).toLocaleDateString() : "Not yet counted"}</div></div>
                 <div style={{ textAlign: "right" }}><div style={{ fontSize: 13, fontWeight: 800, color: C.navy }}>{money(a.value)}</div>{a.previousValue > 0 && <div style={{ fontSize: 9, color: a.value <= a.previousValue ? C.green : C.amber }}>{a.value >= a.previousValue ? "+" : ""}{money(a.value - a.previousValue)}</div>}</div>
               </div>)}
             </div>
@@ -2981,6 +3039,35 @@ const OrdersScreen = ({ countItems, items, assignments, locations = [], role, se
             </div>
             <FInput label="Note (optional)" value={tagNote} onChange={setTagNote} placeholder="e.g. banquet used extra cases, not on ticket" />
             {tagging.varianceTag && <button onClick={() => saveTag(null)} disabled={tagSaving} style={{ background: "none", border: "none", color: C.textMuted, fontSize: 12, fontWeight: 600, cursor: "pointer", textAlign: "center" }}>Clear tag</button>}
+          </div>
+        </Modal>
+      )}
+
+      {areaDetail && (
+        <Modal title={areaDetail.areaName} onClose={() => setAreaDetail(null)}>
+          <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-end", paddingBottom: 12, borderBottom: `1px solid ${C.border}` }}>
+              <div>
+                <div style={{ fontSize: 10, color: C.textMuted, fontWeight: 700, textTransform: "uppercase" }}>Most recent count</div>
+                <div style={{ fontSize: 12, color: C.textSub, marginTop: 2 }}>{areaDetail.date ? new Date(areaDetail.date).toLocaleDateString() : "—"}</div>
+              </div>
+              <div style={{ fontSize: 26, fontWeight: 800, color: C.navy }}>{money(areaDetail.value)}</div>
+            </div>
+            {(areaDetail.items || []).length === 0 ? (
+              <p style={{ fontSize: 12, color: C.textMuted, margin: 0 }}>No itemized detail available for this count.</p>
+            ) : (
+              <div style={{ display: "flex", flexDirection: "column", gap: 6, maxHeight: 360, overflowY: "auto" }}>
+                {areaDetail.items.map(it => (
+                  <div key={it.itemId || it.name} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10, padding: "8px 0", borderBottom: `1px solid ${C.border}` }}>
+                    <div style={{ minWidth: 0 }}>
+                      <div style={{ fontSize: 12, fontWeight: 700, color: C.navy, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{it.name}</div>
+                      <div style={{ fontSize: 10, color: C.textMuted }}>{it.countStatus === "zero_confirmed" ? "Confirmed zero" : it.countStatus === "not_seen" ? "Not seen" : `${it.qty} × ${money(it.unitCost)}`}</div>
+                    </div>
+                    <div style={{ fontSize: 12, fontWeight: 800, color: C.navy, flexShrink: 0 }}>{money(it.value)}</div>
+                  </div>
+                ))}
+              </div>
+            )}
           </div>
         </Modal>
       )}

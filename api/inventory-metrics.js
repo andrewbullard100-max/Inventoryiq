@@ -213,7 +213,15 @@ async function handleGet(req, res, supabase, auth) {
 
   const currentValue = snapshots[0]?.value || 0, previousValue = snapshots[1]?.value || 0;
   const variance = money2(currentValue - previousValue), variancePct = previousValue > 0 ? variance / previousValue : null;
-  const areaBreakdown = areas.map(area => { const latest = latestCountByArea.get(area.id), prior = priorCountByArea.get(area.id); return { areaId: area.id, locationId: area.location_id, areaName: area.name, value: money2(latest?.value || 0), previousValue: money2(prior?.value || 0), variance: money2((latest?.value || 0) - (prior?.value || 0)), date: latest?.date || null, historicallyCosted: !!latest && latest.legacyLines === 0 && latest.lockedLines > 0, status: latest?.status || 'not_started' }; }).sort((a, b) => b.value - a.value);
+  const lineItemsForArea = (count) => (count?.lines || [])
+    .filter(l => l.countStatus !== 'not_counted')
+    .map(l => {
+      const meta = itemById.get(l.item_id) || {};
+      return { itemId: l.item_id, name: meta.name || 'Unknown item', sku: meta.vendor_item_code || l.item_id || null, qty: l.qty, unitCost: money2(l.unitCost), value: money2(l.value), countStatus: l.countStatus };
+    })
+    .sort((a, b) => b.value - a.value);
+
+  const areaBreakdown = areas.map(area => { const latest = latestCountByArea.get(area.id), prior = priorCountByArea.get(area.id); return { areaId: area.id, locationId: area.location_id, areaName: area.name, value: money2(latest?.value || 0), previousValue: money2(prior?.value || 0), variance: money2((latest?.value || 0) - (prior?.value || 0)), date: latest?.date || null, historicallyCosted: !!latest && latest.legacyLines === 0 && latest.lockedLines > 0, status: latest?.status || 'not_started', items: lineItemsForArea(latest) }; }).sort((a, b) => b.value - a.value);
 
   const allLines = [...latestCountByArea.values()].flatMap(c => c.lines);
   const statusCounts = allLines.reduce((acc, l) => { acc[l.countStatus] = (acc[l.countStatus] || 0) + 1; return acc; }, {});
