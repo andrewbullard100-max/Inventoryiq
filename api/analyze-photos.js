@@ -167,6 +167,14 @@ Item list for this area:
 ${JSON.stringify(promptItemList, null, 2)}`;
 
     // 3. Call Claude Vision (imageBlocks were built from Storage downloads above).
+    //    Streamed rather than a single blocking JSON response: this call routinely runs long
+    //    (chain-of-thought reasoning over up to 15 images, up to 8192 output tokens --
+    //    vercel.json sets a 300s maxDuration on this function for exactly that reason), and a
+    //    long-lived connection with zero bytes flowing is exactly the shape of request that
+    //    gets silently truncated by intermediate infrastructure -- coming back as a 200 with
+    //    an empty content array instead of a clean error. Reading the response as a stream
+    //    avoids that failure mode; everything downstream still treats the result as one text
+    //    string, same as before.
     const response = await fetch(ANTHROPIC_API_URL, {
       method: 'POST',
       headers: {
@@ -177,6 +185,7 @@ ${JSON.stringify(promptItemList, null, 2)}`;
       body: JSON.stringify({
         model: MODEL,
         max_tokens: 8192,
+        stream: true,
         system: systemPrompt,
         messages: [
           {
@@ -197,22 +206,63 @@ ${JSON.stringify(promptItemList, null, 2)}`;
       return;
     }
 
-    const data = await response.json();
-    const textBlock = (data.content || []).find((c) => c.type === 'text');
-    if (!textBlock) {
-      res.status(502).json({ error: 'No text response from Claude' });
+    let text = '';
+    let stopReason = null;
+    let streamError = null;
+    try {
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+      // eslint-disable-next-line no-constant-condition
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const events = buffer.split('\n\n');
+        buffer = events.pop(); // the last split piece may be a partial event -- carry it to the next read
+        for (const evt of events) {
+          for (const line of evt.split('\n')) {
+            if (!line.startsWith('data:')) continue;
+            let payload;
+            try { payload = JSON.parse(line.slice(5).trim()); } catch { continue; }
+            if (payload.type === 'content_block_delta' && payload.delta?.type === 'text_delta') {
+              text += payload.delta.text;
+            } else if (payload.type === 'message_delta' && payload.delta?.stop_reason) {
+              stopReason = payload.delta.stop_reason;
+            } else if (payload.type === 'error') {
+              streamError = payload.error?.message || 'Claude returned a stream error';
+            }
+          }
+        }
+      }
+    } catch (e) {
+      console.error('analyze-photos: stream read failed', { areaId, stageId, countId, message: e.message });
+      res.status(502).json({ error: 'Claude stream was interrupted', details: e.message });
+      return;
+    }
+
+    if (streamError) {
+      console.error('analyze-photos: Claude stream returned an error event', { areaId, stageId, countId, streamError });
+      res.status(502).json({ error: 'Claude API stream error', details: streamError });
+      return;
+    }
+
+    if (!text) {
+      // Should be rare now that this is streamed, but if it still happens, this is what makes
+      // the next occurrence diagnosable instead of a dead end.
+      console.error('analyze-photos: no text content in Claude stream', { areaId, stageId, countId, stopReason });
+      res.status(502).json({ error: 'No text response from Claude', stopReason });
       return;
     }
 
     let parsed;
     try {
-      const raw = textBlock.text;
-      const markerIdx = raw.lastIndexOf('FINAL ANSWER:');
-      const afterMarker = markerIdx >= 0 ? raw.slice(markerIdx + 'FINAL ANSWER:'.length) : raw;
+      const markerIdx = text.lastIndexOf('FINAL ANSWER:');
+      const afterMarker = markerIdx >= 0 ? text.slice(markerIdx + 'FINAL ANSWER:'.length) : text;
       const cleaned = afterMarker.replace(/```json|```/g, '').trim();
       parsed = JSON.parse(cleaned);
     } catch (e) {
-      res.status(502).json({ error: 'Could not parse Claude response as JSON', raw: textBlock.text });
+      res.status(502).json({ error: 'Could not parse Claude response as JSON', raw: text });
       return;
     }
 
